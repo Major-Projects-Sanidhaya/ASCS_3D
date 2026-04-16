@@ -72,6 +72,10 @@ class SwarmController:
         for node in self._nodes.values():
             self._general.register_node(node)
 
+        self._general._agent.seed_all_nodes(
+            [n._agent for n in self._nodes.values()]
+        )
+
         self._gui_weights: dict = {}
         self._step_count:  int  = 0
 

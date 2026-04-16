@@ -47,15 +47,16 @@ class NodeController(BaseController):
         Advance the Node agent by one simulation tick.
 
         Order:
-          1. Tick uptime.
-          2. Clear stale packet buffer.
-          3. Each Scout emits a packet into the Node's buffer.
-          4. Each Worker emits a packet into the Node's buffer.
-          5. Aggregate observations to update cluster embedding.
-          6. Compute velocity (or apply obstacle reflex if triggered).
-          7. Broadcast VelocityCommands to Scouts.
-          8. Broadcast TaskCommands to Workers.
-          9. Update Node position.
+          1.  Tick uptime.
+          2.  Clear stale packet buffer.
+          3.  Each Scout emits a packet into the Node's buffer.
+          4.  Each Worker emits a packet into the Node's buffer.
+          5.  Aggregate observations to update cluster embedding.
+          6.  update_op_phase() — transition SCOUTING/TASKING/HOLDING.
+          7.  Compute velocity (or apply obstacle reflex if triggered).
+          8.  Broadcast VelocityCommands to Scouts.
+          9.  Broadcast TaskCommands to Workers (phase-gated).
+          10. Update Node position.
         """
         self.tick_uptime(dt)
         self._agent.clear_packet_buffer()
@@ -68,6 +69,7 @@ class NodeController(BaseController):
             wc._agent.emit_packet(self._agent)
 
         self._agent.aggregate_observations()
+        self._agent.update_op_phase()          # must run after aggregation
 
         reflex = self._agent.handle_obstacle_reflex(99.0)
         if reflex is None:

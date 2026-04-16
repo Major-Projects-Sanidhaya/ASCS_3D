@@ -21,6 +21,15 @@ from General.ZoneMap import ZoneMap
 
 # ── Module Constants ──
 
+# Operation-phase constants
+OP_SCOUTING = 'SCOUTING'   # Scouts exploring, Workers holding
+OP_TASKING  = 'TASKING'    # Coverage sufficient, Workers deploying
+OP_HOLDING  = 'HOLDING'    # Degraded or no token — everyone holds
+
+COVERAGE_THRESHOLD   = 0.4   # fraction of zone covered before Workers deploy
+MIN_PACKETS_TO_TASK  = 2     # minimum Scout packets received before considering deploy
+TASK_HOLD_ALTITUDE   = 3.0   # altitude Workers hover at while waiting
+
 MAX_SPEED          = 4.0    # m/s — maximum Node movement speed
 SEP_RADIUS         = 5.0    # m   — separation force activation radius
 ALTITUDE           = 3.0    # m   — default hover altitude
@@ -95,10 +104,19 @@ class Node:
         self._cluster_embedding: np.ndarray = np.zeros(64, dtype=float)
 
         self._mode:     str        = 'SCOUT'
-        self._waypoint: np.ndarray = np.array([0.0, 0.0, altitude], dtype=float)
+        try:
+            centre = zone_map_ref.get_zone_centre(zone_hash)
+            self._waypoint: np.ndarray = np.array([centre[0], centre[1], altitude], dtype=float)
+        except Exception:
+            self._waypoint: np.ndarray = np.array([0.0, 0.0, altitude], dtype=float)
 
         self._uptime: float = 0.0
         self._health: float = 1.0
+
+        self._op_phase:         str   = OP_SCOUTING
+        self._coverage_fraction: float = 0.0
+        self._frames_scouting:  int   = 0     # frames spent in SCOUTING phase
+        self._min_scout_frames: int   = 60    # wait at least 1 s before TASKING
 
     # ── Downlink from General ──
 
@@ -271,6 +289,10 @@ class Node:
         except Exception:
             pass
 
+        if self._mode == 'SCOUT':
+            w_coh = max(0.0, w_coh - 0.15)   # extra cohesion reduction in scout mode
+            w_sep = min(1.0, w_sep + 0.1)    # extra separation push in scout mode
+
         return w_sep, w_align, w_coh
 
     # ── Reynolds Kernel ──
@@ -367,7 +389,11 @@ class Node:
         sub_wps: List[np.ndarray] = []
         for i in range(n):
             angle  = 2 * math.pi * i / n
-            offset = np.array([math.cos(angle), math.sin(angle), 0.0]) * 2.0
+            zone_radius = min(
+                getattr(self._zone_map, 'cell_w', 5.0) * 0.45,
+                getattr(self._zone_map, 'cell_h', 5.0) * 0.45,
+            )
+            offset = np.array([math.cos(angle), math.sin(angle), 0.0]) * zone_radius
             sub_wps.append(base_waypoint + offset)
         return sub_wps
 
@@ -397,6 +423,67 @@ class Node:
             'timestamp':  self._uptime,
         }
 
+    # ── Operation Phase ──
+
+    def update_op_phase(self) -> None:
+        """
+        Transitions between SCOUTING and TASKING based on Scout coverage.
+        Called every step after aggregate_observations() and before broadcasting.
+
+        SCOUTING → TASKING: coverage >= COVERAGE_THRESHOLD
+                             AND frames_scouting >= _min_scout_frames
+                             AND len(last_packets) >= MIN_PACKETS_TO_TASK
+        TASKING → SCOUTING: coverage drops below COVERAGE_THRESHOLD * 0.7
+                             (hysteresis — prevents rapid switching)
+        * → HOLDING:        when token is not valid (General silent)
+        """
+        if not self.token_is_valid():
+            self._op_phase = OP_HOLDING
+            return
+
+        # Update coverage estimate from received packets
+        if self._last_packets:
+            self._coverage_fraction = min(
+                len(self._last_packets) / max(len(self._scouts), 1), 1.0)
+
+        if self._op_phase == OP_SCOUTING:
+            self._frames_scouting += 1
+            ready = (
+                self._coverage_fraction >= COVERAGE_THRESHOLD
+                and self._frames_scouting >= self._min_scout_frames
+                and len(self._last_packets) >= MIN_PACKETS_TO_TASK
+            )
+            if ready:
+                self._op_phase = OP_TASKING
+                self._frames_scouting = 0   # reset for next scouting cycle
+
+        elif self._op_phase == OP_TASKING:
+            # Drop back to scouting if coverage degrades significantly
+            if self._coverage_fraction < COVERAGE_THRESHOLD * 0.7:
+                self._op_phase = OP_SCOUTING
+
+        elif self._op_phase == OP_HOLDING:
+            # Return to scouting once token becomes valid again
+            if self.token_is_valid():
+                self._op_phase = OP_SCOUTING
+
+    def get_op_phase(self) -> str:
+        """Return the current operation phase string."""
+        return self._op_phase
+
+    def get_worker_command(self) -> Optional[dict]:
+        """
+        Returns a TaskCommand for Workers based on current op phase.
+        Returns None if Workers should hold (no command sent).
+
+        SCOUTING → None  (Workers hold in place)
+        HOLDING  → None
+        TASKING  → MOVE_TO current waypoint
+        """
+        if self._op_phase in (OP_SCOUTING, OP_HOLDING):
+            return None
+        return self.build_task_command('MOVE_TO', self._waypoint, {})
+
     def broadcast_scout_commands(self, scouts: List) -> None:
         """Compute velocity and deliver VelocityCommand to every Scout."""
         v   = self.compute_velocity()
@@ -405,11 +492,23 @@ class Node:
             s.receive_velocity_command(cmd)
 
     def broadcast_worker_commands(self, workers: List) -> None:
-        """Deliver MOVE_TO TaskCommand toward active waypoint to every Worker."""
-        wp  = self._waypoint.copy()
-        cmd = self.build_task_command('MOVE_TO', wp, {})
-        for w in workers:
-            w.receive_task_command(cmd)
+        """
+        Send commands to Workers based on current op phase.
+        SCOUTING/HOLDING: send HOVER so Workers stay at spawn position.
+        TASKING:          send MOVE_TO current waypoint.
+        Only sends HOVER to Workers that are currently IDLE to avoid
+        interrupting a task already in progress.
+        """
+        cmd = self.get_worker_command()
+        if cmd is None:
+            # Phase-gate not cleared — keep Workers on station
+            hover_cmd = self.build_task_command('HOVER', self.pos.copy(), {})
+            for w in workers:
+                if w._task_state == 'IDLE':
+                    w.receive_task_command(hover_cmd)
+        else:
+            for w in workers:
+                w.receive_task_command(cmd)
 
     # ── Uplink Report ──
 
@@ -420,11 +519,13 @@ class Node:
             'zone_hash':         self.zone_hash,
             'centroid':          centroid.tolist(),
             'health':            self._health,
-            'coverage_fraction': min(len(self._last_packets) / 8.0, 1.0),
+            'coverage_fraction': self._coverage_fraction,
             'scout_count':       len(self._scouts),
             'collision_risk':    0.0,
             'velocity_mean':     self.vel.tolist(),
             'timestamp':         self._uptime,
+            'op_phase':          self._op_phase,
+            'frames_scouting':   self._frames_scouting,
         }
 
     def send_report(self, general) -> None:
@@ -435,9 +536,12 @@ class Node:
 
     def update_position(self, dt: float) -> None:
         """Advance position by vel*dt; clamp to arena bounds and altitude floor."""
-        self.pos      += self.vel * dt
-        self.pos[:2]   = np.clip(self.pos[:2], -50.0, 50.0)
-        self.pos[2]    = max(0.5, float(self.pos[2]))
+        self.pos += self.vel * dt
+        hw = getattr(self._zone_map, 'arena_w', 20.0) / 2.0 - 0.5
+        hh = getattr(self._zone_map, 'arena_h', 20.0) / 2.0 - 0.5
+        self.pos[0] = float(np.clip(self.pos[0], -hw, hw))
+        self.pos[1] = float(np.clip(self.pos[1], -hh, hh))
+        self.pos[2] = max(0.5, float(self.pos[2]))
         self._uptime   += dt
         self._token_age += dt
 

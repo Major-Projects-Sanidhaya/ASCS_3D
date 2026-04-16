@@ -207,7 +207,9 @@ class Scout:
             self.vel[2]   = self.altitude_hold(float(self.pos[2]))
 
         self.pos    += self.vel * dt
-        self.pos[2]  = max(0.3, float(self.pos[2]))
+        self.pos[0]  = float(np.clip(self.pos[0], -9.5, 9.5))
+        self.pos[1]  = float(np.clip(self.pos[1], -9.5, 9.5))
+        self.pos[2]  = float(np.clip(self.pos[2],  0.3, 9.0))
 
         horiz_speed = float(np.linalg.norm(self.vel[:2]))
         if horiz_speed > 1e-3:

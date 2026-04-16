@@ -92,16 +92,22 @@ class General:
         self._uptime:            float             = 0.0
 
     def _build_waypoints(self) -> List[np.ndarray]:
-        """Build 5 spread waypoints: 4 corners + arena centre at altitude 3."""
-        w   = self._zone_map.arena_w / 2.0
-        h   = self._zone_map.arena_h / 2.0
-        alt = 3.0
+        """Build 9 waypoints covering far corners, inner ring, and centre."""
+        hw    = self._zone_map.arena_w / 2.0 - 1.0
+        hh    = self._zone_map.arena_h / 2.0 - 1.0
+        mid_w = self._zone_map.arena_w / 4.0
+        mid_h = self._zone_map.arena_h / 4.0
+        alt   = 3.0
         return [
-            np.array([-w * 0.8,  h * 0.8, alt]),
-            np.array([ w * 0.8,  h * 0.8, alt]),
-            np.array([ w * 0.8, -h * 0.8, alt]),
-            np.array([-w * 0.8, -h * 0.8, alt]),
-            np.array([ 0.0,      0.0,      alt]),
+            np.array([-hw,    -hh,    alt]),   # far corners — force wide spread
+            np.array([ hw,    -hh,    alt]),
+            np.array([ hw,     hh,    alt]),
+            np.array([-hw,     hh,    alt]),
+            np.array([-mid_w, -mid_h, alt]),   # inner ring
+            np.array([ mid_w, -mid_h, alt]),
+            np.array([ mid_w,  mid_h, alt]),
+            np.array([-mid_w,  mid_h, alt]),
+            np.array([ 0.0,    0.0,   alt]),   # centre last
         ]
 
     # ── World Model ──
@@ -248,7 +254,7 @@ class General:
             'waypoint':    waypoint.tolist(),
             'mode':        mode,
             'priority':    priority,
-            'ttl':         self._emit_interval * 1.2,
+            'ttl':         self._emit_interval * 2.5,
             'threat_mask': self._threat_mask,
             'timestamp':   self._uptime,
         }
@@ -257,13 +263,40 @@ class General:
         """
         Emit one GoalToken per active zone and deliver to every node agent.
         Nodes self-select internally based on their zone_hash.
+        Gated by emit_timer — fires every emit_interval seconds.
         """
-        for zh in self._zone_map.active_zones():
-            mode  = self.select_mode_for_zone(zh)
-            wp    = self.select_next_waypoint()
-            token = self.build_goal_token(zh, wp, mode)
+        if not self.should_emit():
+            return
+        for zone_hash in self._zone_map.active_zones():
+            wp   = self.select_next_waypoint()
+            mode = self.select_mode_for_zone(zone_hash)
+            token = self.build_goal_token(zone_hash, wp, mode)
             for node in nodes:
                 node.receive_goal_token(token)
+
+    def inject_token_direct(self, zone_hash: int, nodes: List) -> bool:
+        """
+        Bypasses all timers. Builds a token for zone_hash and delivers
+        it directly to every node in the list. Each node self-selects.
+        Returns True if at least one node accepted the token.
+        """
+        wp    = self.select_next_waypoint()
+        mode  = self.select_mode_for_zone(zone_hash)
+        token = self.build_goal_token(zone_hash, wp, mode)
+        accepted = False
+        for node in nodes:
+            if node.receive_goal_token(token):
+                accepted = True
+        return accepted
+
+    def seed_all_nodes(self, nodes: List) -> None:
+        """
+        Force-delivers one goal token to every active zone.
+        Call once after swarm construction to guarantee every node
+        starts with a valid token. Bypasses emit_timer entirely.
+        """
+        for zone_hash in self._zone_map.active_zones():
+            self.inject_token_direct(zone_hash, nodes)
 
     # ── Zone Topology ──
 

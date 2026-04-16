@@ -115,7 +115,20 @@ class Worker:
     # ── Command Reception ──
 
     def receive_task_command(self, cmd: dict) -> None:
-        """Accept a TaskCommand; transition from IDLE → MOVING if idle."""
+        """Accept a TaskCommand; transition from IDLE → MOVING if idle.
+        HOVER action is handled specially: target_pos is locked to current
+        position and the task state is left as IDLE so the Worker does not
+        begin moving.
+        """
+        action = cmd.get('action', 'MOVE_TO')
+        if action == 'HOVER':
+            # Lock the hover target to where the Worker is right now
+            cmd = dict(cmd)                          # copy — don't mutate original
+            cmd['target_pos'] = self.pos.tolist()
+            self._current_cmd = cmd
+            self._cmd_age     = 0.0
+            # Do NOT change task_state — stay IDLE if already IDLE
+            return
         self._current_cmd = cmd
         self._cmd_age     = 0.0
         if self._task_state == 'IDLE':
@@ -136,6 +149,13 @@ class Worker:
         """
         self._cmd_age += dt
         self._uptime  += dt
+
+        # HOVER: stay IDLE and gently damp lateral velocity
+        if (self._task_state == 'IDLE'
+                and self._current_cmd is not None
+                and self._current_cmd.get('action') == 'HOVER'):
+            self.vel[:2] *= 0.85
+            return
 
         if self._cmd_age > CMD_TIMEOUT and self._task_state not in ('IDLE', 'COMPLETE'):
             self._task_state = 'IDLE'
@@ -199,6 +219,20 @@ class Worker:
 
     def update_position(self, dt: float) -> None:
         """Advance Worker position by one simulation tick."""
+        # HOVER: hold the locked position, damp velocity toward zero
+        if (self._task_state == 'IDLE'
+                and self._current_cmd is not None
+                and self._current_cmd.get('action') == 'HOVER'):
+            target = np.array(self._current_cmd['target_pos'], dtype=float)
+            hold_v = (target - self.pos) * 2.0
+            hold_v[2] = self.altitude_hold(target[2])
+            self.vel = self.vel * 0.7 + hold_v * 0.3
+            self.pos = self.pos + self.vel * dt
+            self.pos[0] = float(np.clip(self.pos[0], -9.5, 9.5))
+            self.pos[1] = float(np.clip(self.pos[1], -9.5, 9.5))
+            self.pos[2] = float(np.clip(self.pos[2],  0.3, 9.0))
+            return
+
         if (self._task_state == 'MOVING' and
                 self._current_cmd is not None and
                 self._cmd_age < CMD_TIMEOUT):
@@ -213,7 +247,9 @@ class Worker:
             self.vel[2]   = self.altitude_hold(ALTITUDE)
 
         self.pos   += self.vel * dt
-        self.pos[2] = max(0.3, float(self.pos[2]))
+        self.pos[0] = float(np.clip(self.pos[0], -9.5, 9.5))
+        self.pos[1] = float(np.clip(self.pos[1], -9.5, 9.5))
+        self.pos[2] = float(np.clip(self.pos[2],  0.3, 9.0))
 
         horiz_speed = float(np.linalg.norm(self.vel[:2]))
         if horiz_speed > 1e-3:
