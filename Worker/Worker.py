@@ -115,20 +115,26 @@ class Worker:
     # ── Command Reception ──
 
     def receive_task_command(self, cmd: dict) -> None:
-        """Accept a TaskCommand; transition from IDLE → MOVING if idle.
-        HOVER action is handled specially: target_pos is locked to current
-        position and the task state is left as IDLE so the Worker does not
-        begin moving.
-        """
-        action = cmd.get('action', 'MOVE_TO')
-        if action == 'HOVER':
-            # Lock the hover target to where the Worker is right now
-            cmd = dict(cmd)                          # copy — don't mutate original
-            cmd['target_pos'] = self.pos.tolist()
-            self._current_cmd = cmd
-            self._cmd_age     = 0.0
-            # Do NOT change task_state — stay IDLE if already IDLE
+        """Accept a TaskCommand; transition from IDLE → MOVING if idle."""
+        if not cmd:
             return
+        action = cmd.get('action', 'MOVE_TO')
+
+        # HOVER: pin Worker to its current spawn position, stay IDLE
+        if action == 'HOVER':
+            self._current_cmd = {
+                'action':     'HOVER',
+                'target_pos': self.pos.tolist(),
+                'params':     {},
+                'ttl':        9999.0,
+                'timestamp':  self._uptime,
+            }
+            return
+
+        # Any other command: only accept if authorized by TASKING phase
+        if not cmd.get('authorized', False):
+            return
+
         self._current_cmd = cmd
         self._cmd_age     = 0.0
         if self._task_state == 'IDLE':
@@ -147,21 +153,18 @@ class Worker:
         States: IDLE → MOVING → EXECUTING → COMPLETE / FAILED → IDLE
         Timeout: cmd_age > CMD_TIMEOUT and not IDLE/COMPLETE → revert to IDLE.
         """
-        self._cmd_age += dt
         self._uptime  += dt
+        self._cmd_age += dt
 
-        # HOVER: stay IDLE and gently damp lateral velocity
-        if (self._task_state == 'IDLE'
-                and self._current_cmd is not None
-                and self._current_cmd.get('action') == 'HOVER'):
-            self.vel[:2] *= 0.85
+        # No authorized command, HOVER, or already IDLE — hold, damp, return
+        if (self._current_cmd is None
+                or self._current_cmd.get('action') == 'HOVER'
+                or self._task_state == 'IDLE'):
+            self.vel *= 0.85
             return
 
         if self._cmd_age > CMD_TIMEOUT and self._task_state not in ('IDLE', 'COMPLETE'):
             self._task_state = 'IDLE'
-            return
-
-        if self._task_state == 'IDLE':
             return
 
         if self._task_state == 'MOVING':
@@ -218,35 +221,57 @@ class Worker:
     # ── Position Update ──
 
     def update_position(self, dt: float) -> None:
-        """Advance Worker position by one simulation tick."""
-        # HOVER: hold the locked position, damp velocity toward zero
-        if (self._task_state == 'IDLE'
-                and self._current_cmd is not None
-                and self._current_cmd.get('action') == 'HOVER'):
-            target = np.array(self._current_cmd['target_pos'], dtype=float)
-            hold_v = (target - self.pos) * 2.0
-            hold_v[2] = self.altitude_hold(target[2])
-            self.vel = self.vel * 0.7 + hold_v * 0.3
-            self.pos = self.pos + self.vel * dt
+        """
+        Movement gated on authorized flag.
+        If not authorized: pin to spawn, zero velocity.
+        If authorized: navigate toward task target.
+        """
+        # Gate 1: no command at all → hold completely still
+        if self._current_cmd is None:
+            self.vel *= 0.5
+            self.pos += self.vel * dt
+            return
+
+        action     = self._current_cmd.get('action', 'MOVE_TO')
+        authorized = self._current_cmd.get('authorized', False)
+
+        # Gate 2: HOVER or not authorized → pin to target position
+        if action == 'HOVER' or not authorized:
+            target = np.array(self._current_cmd['target_pos'])
+            hold   = (target - self.pos) * 1.5
+            hold[2] = self.altitude_hold(target[2])
+            self.vel = self.vel * 0.6 + hold * 0.4
+            horiz = float(np.linalg.norm(self.vel[:2]))
+            if horiz > 0.5:
+                self.vel[:2] = self.vel[:2] / horiz * 0.5
+            self.pos += self.vel * dt
             self.pos[0] = float(np.clip(self.pos[0], -9.5, 9.5))
             self.pos[1] = float(np.clip(self.pos[1], -9.5, 9.5))
             self.pos[2] = float(np.clip(self.pos[2],  0.3, 9.0))
             return
 
-        if (self._task_state == 'MOVING' and
-                self._current_cmd is not None and
-                self._cmd_age < CMD_TIMEOUT):
-            target = np.array(self._current_cmd['target_pos'], dtype=float)
-            diff   = target - self.pos
-            dist   = float(np.linalg.norm(diff))
-            v_target = (diff / (dist + 1e-6)) * MAX_SPEED if dist > 0.01 else np.zeros(3)
-            v_target[2] = self.altitude_hold(ALTITUDE)
-            self.pid_update(v_target, dt)
-        else:
-            self.vel[:2] *= 0.9
-            self.vel[2]   = self.altitude_hold(ALTITUDE)
+        # Gate 3: authorized MOVE_TO — navigate to target
+        if self._task_state in ('IDLE', 'COMPLETE', 'FAILED'):
+            self.vel *= 0.7
+            self.pos += self.vel * dt
+            return
 
-        self.pos   += self.vel * dt
+        target    = np.array(self._current_cmd['target_pos'])
+        direction = target - self.pos
+        dist      = float(np.linalg.norm(direction))
+        if dist > 0.01:
+            v_target    = direction / dist * MAX_SPEED
+            v_target[2] = self.altitude_hold(
+                float(target[2]) if len(target) > 2 else 3.0)
+            self.vel = self.vel * 0.3 + v_target * 0.7
+        else:
+            self.vel *= 0.5
+
+        speed = float(np.linalg.norm(self.vel[:2]))
+        if speed > MAX_SPEED:
+            self.vel[:2] = self.vel[:2] / speed * MAX_SPEED
+
+        self.pos += self.vel * dt
         self.pos[0] = float(np.clip(self.pos[0], -9.5, 9.5))
         self.pos[1] = float(np.clip(self.pos[1], -9.5, 9.5))
         self.pos[2] = float(np.clip(self.pos[2],  0.3, 9.0))

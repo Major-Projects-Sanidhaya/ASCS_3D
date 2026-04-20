@@ -76,6 +76,9 @@ class SwarmController:
             [n._agent for n in self._nodes.values()]
         )
 
+        # Give Nodes a back-reference so they can query General authorization.
+        self._zone_map._general_ref = self._general._agent
+
         self._gui_weights: dict = {}
         self._step_count:  int  = 0
 

@@ -30,6 +30,8 @@ COVERAGE_THRESHOLD   = 0.4   # fraction of zone covered before Workers deploy
 MIN_PACKETS_TO_TASK  = 2     # minimum Scout packets received before considering deploy
 TASK_HOLD_ALTITUDE   = 3.0   # altitude Workers hover at while waiting
 
+MIN_SCOUTING_SECONDS = 15.0  # must scout for at least this long before TASKING
+
 MAX_SPEED          = 4.0    # m/s — maximum Node movement speed
 SEP_RADIUS         = 5.0    # m   — separation force activation radius
 ALTITUDE           = 3.0    # m   — default hover altitude
@@ -117,6 +119,7 @@ class Node:
         self._coverage_fraction: float = 0.0
         self._frames_scouting:  int   = 0     # frames spent in SCOUTING phase
         self._min_scout_frames: int   = 60    # wait at least 1 s before TASKING
+        self._last_known_coverage: float = 0.0
 
     # ── Downlink from General ──
 
@@ -382,20 +385,24 @@ class Node:
     # ── Waypoint Decomposition ──
 
     def decompose_waypoint(self, base_waypoint: np.ndarray) -> List[np.ndarray]:
-        """Fan out the zone-level waypoint into per-subordinate offsets on a ring."""
-        n = len(self._scouts) + len(self._workers)
-        if n == 0:
-            return [base_waypoint.copy()]
-        sub_wps: List[np.ndarray] = []
-        for i in range(n):
-            angle  = 2 * math.pi * i / n
-            zone_radius = min(
-                getattr(self._zone_map, 'cell_w', 5.0) * 0.45,
-                getattr(self._zone_map, 'cell_h', 5.0) * 0.45,
+        """Distribute sub-waypoints so Scouts fan out across the full zone."""
+        total = max(len(self._scouts) + len(self._workers), 1)
+        try:
+            radius = min(
+                self._zone_map.cell_w * 0.42,
+                self._zone_map.cell_h * 0.42,
             )
-            offset = np.array([math.cos(angle), math.sin(angle), 0.0]) * zone_radius
-            sub_wps.append(base_waypoint + offset)
-        return sub_wps
+        except Exception:
+            radius = 3.5
+        result = []
+        for i in range(total):
+            angle = 2 * math.pi * i / total
+            r = radius if i % 2 == 0 else radius * 0.5
+            offset = np.array([math.cos(angle) * r,
+                               math.sin(angle) * r,
+                               0.0])
+            result.append(base_waypoint + offset)
+        return result
 
     # ── Command Dispatch ──
 
@@ -427,43 +434,48 @@ class Node:
 
     def update_op_phase(self) -> None:
         """
-        Transitions between SCOUTING and TASKING based on Scout coverage.
-        Called every step after aggregate_observations() and before broadcasting.
+        Transitions between SCOUTING and TASKING based on Scout coverage
+        AND General authorization.
 
-        SCOUTING → TASKING: coverage >= COVERAGE_THRESHOLD
-                             AND frames_scouting >= _min_scout_frames
-                             AND len(last_packets) >= MIN_PACKETS_TO_TASK
-        TASKING → SCOUTING: coverage drops below COVERAGE_THRESHOLD * 0.7
-                             (hysteresis — prevents rapid switching)
+        SCOUTING → TASKING: local_ready AND general_authorized
+        TASKING → SCOUTING: coverage drops below COVERAGE_THRESHOLD * 0.6
         * → HOLDING:        when token is not valid (General silent)
         """
         if not self.token_is_valid():
             self._op_phase = OP_HOLDING
             return
 
-        # Update coverage estimate from received packets
         if self._last_packets:
             self._coverage_fraction = min(
                 len(self._last_packets) / max(len(self._scouts), 1), 1.0)
 
         if self._op_phase == OP_SCOUTING:
             self._frames_scouting += 1
-            ready = (
+
+            general_authorized = False
+            try:
+                general_authorized = self._zone_map._general_ref.is_worker_authorized(
+                    self.zone_hash)
+            except Exception:
+                general_authorized = (
+                    self._coverage_fraction >= COVERAGE_THRESHOLD
+                    and self._frames_scouting >= self._min_scout_frames)
+
+            local_ready = (
                 self._coverage_fraction >= COVERAGE_THRESHOLD
                 and self._frames_scouting >= self._min_scout_frames
                 and len(self._last_packets) >= MIN_PACKETS_TO_TASK
             )
-            if ready:
+
+            if local_ready and general_authorized:
                 self._op_phase = OP_TASKING
-                self._frames_scouting = 0   # reset for next scouting cycle
+                self._frames_scouting = 0
 
         elif self._op_phase == OP_TASKING:
-            # Drop back to scouting if coverage degrades significantly
-            if self._coverage_fraction < COVERAGE_THRESHOLD * 0.7:
+            if self._coverage_fraction < COVERAGE_THRESHOLD * 0.6:
                 self._op_phase = OP_SCOUTING
 
         elif self._op_phase == OP_HOLDING:
-            # Return to scouting once token becomes valid again
             if self.token_is_valid():
                 self._op_phase = OP_SCOUTING
 
@@ -485,47 +497,147 @@ class Node:
         return self.build_task_command('MOVE_TO', self._waypoint, {})
 
     def broadcast_scout_commands(self, scouts: List) -> None:
-        """Compute velocity and deliver VelocityCommand to every Scout."""
-        v   = self.compute_velocity()
-        cmd = self.build_velocity_command(v)
-        for s in scouts:
-            s.receive_velocity_command(cmd)
+        """Each Scout gets a unique sub-waypoint so they fan out across the zone."""
+        if not scouts:
+            return
+        n = len(scouts)
+        try:
+            radius = min(
+                self._zone_map.cell_w * 0.42,
+                self._zone_map.cell_h * 0.42,
+            )
+        except Exception:
+            radius = 3.5
+
+        w_sep, w_align, w_coh = self.get_effective_weights()
+        if self._mode == 'SCOUT':
+            w_coh   = 0.0
+            w_align = 0.1
+            w_sep   = min(1.0, w_sep + 0.2)
+        w_wp = 0.8
+
+        for i, scout in enumerate(scouts):
+            angle  = 2 * math.pi * i / n
+            r      = radius if i % 2 == 0 else radius * 0.55
+            sub_wp = np.array([
+                self._waypoint[0] + math.cos(angle) * r,
+                self._waypoint[1] + math.sin(angle) * r,
+                3.0,
+            ])
+
+            wp_pull = sub_wp - scout.pos
+            wp_dist = float(np.linalg.norm(wp_pull))
+            wp_pull = wp_pull / wp_dist if wp_dist > 0.01 else np.zeros(3)
+
+            other_pos = [s.pos for j, s in enumerate(scouts) if j != i]
+            sep = self.reynolds_separation(other_pos)
+
+            v     = w_sep * sep + w_wp * wp_pull * 2.0
+            speed = float(np.linalg.norm(v))
+            if speed > MAX_SPEED:
+                v = v / speed * MAX_SPEED
+            v[2]  = (3.0 - scout.pos[2]) * 2.0
+
+            scout.receive_velocity_command(self.build_velocity_command(v))
 
     def broadcast_worker_commands(self, workers: List) -> None:
         """
         Send commands to Workers based on current op phase.
-        SCOUTING/HOLDING: send HOVER so Workers stay at spawn position.
-        TASKING:          send MOVE_TO current waypoint.
-        Only sends HOVER to Workers that are currently IDLE to avoid
-        interrupting a task already in progress.
+        SCOUTING/HOLDING: send unauthorized HOVER — Workers pin to spawn.
+        TASKING:          send authorized MOVE_TO — Workers deploy.
         """
-        cmd = self.get_worker_command()
-        if cmd is None:
-            # Phase-gate not cleared — keep Workers on station
-            hover_cmd = self.build_task_command('HOVER', self.pos.copy(), {})
+        if self._op_phase in (OP_SCOUTING, OP_HOLDING):
+            hover = {
+                'action':     'HOVER',
+                'target_pos': self.pos.tolist(),
+                'params':     {},
+                'ttl':        9999.0,
+                'timestamp':  self._uptime,
+                'authorized': False,
+            }
             for w in workers:
                 if w._task_state == 'IDLE':
-                    w.receive_task_command(hover_cmd)
-        else:
-            for w in workers:
-                w.receive_task_command(cmd)
+                    w.receive_task_command(hover)
+            return
+
+        # TASKING phase — Workers are authorized to move
+        cmd = self.build_task_command('MOVE_TO', self._waypoint, {})
+        cmd['authorized'] = True
+        for w in workers:
+            w.receive_task_command(cmd)
 
     # ── Uplink Report ──
 
-    def build_cluster_report(self) -> dict:
-        """Compile an anonymous ClusterStateReport for General."""
-        centroid = self.compute_cluster_centroid()
+    def summarise_coverage(self) -> dict:
+        """
+        Coverage is spatial: fraction of zone sub-cells visited.
+        Uses a 4x4 grid of cells per zone. A cell is 'covered' when
+        a Scout packet reports a position inside that cell.
+        Also enforces minimum scouting time regardless of spatial coverage.
+        """
+        time_coverage = min(
+            self._frames_scouting / (MIN_SCOUTING_SECONDS * 60.0), 1.0
+        )
+
+        if self._last_packets:
+            try:
+                mn, mx  = self._zone_map.get_zone_bounds(self.zone_hash)
+                grid_n  = 4
+                covered = set()
+                for pkt in self._last_packets:
+                    for rp in pkt.get('rel_positions', []):
+                        abs_pos = self.pos[:2] + np.array(rp[:2])
+                        col = int((abs_pos[0] - mn[0]) / (mx[0] - mn[0]) * grid_n)
+                        row = int((abs_pos[1] - mn[1]) / (mx[1] - mn[1]) * grid_n)
+                        col = max(0, min(grid_n - 1, col))
+                        row = max(0, min(grid_n - 1, row))
+                        covered.add((row, col))
+                spatial_cov = len(covered) / (grid_n * grid_n)
+            except Exception:
+                spatial_cov = 0.0
+        else:
+            spatial_cov = 0.0
+
+        combined = (
+            min(time_coverage, spatial_cov)
+            if spatial_cov > 0
+            else time_coverage * 0.5
+        )
+
+        if combined > 0:
+            self._last_known_coverage = combined
+        reported_coverage = combined if combined > 0 else self._last_known_coverage
+
+        obs_mins = [float(p.get('obs_min', 9.9)) for p in self._last_packets] if self._last_packets else [9.9]
+        speeds   = [float(p.get('speed',   0.0)) for p in self._last_packets] if self._last_packets else [0.0]
+
         return {
             'zone_hash':         self.zone_hash,
-            'centroid':          centroid.tolist(),
+            'scout_count':       len(self._last_packets),
+            'coverage_fraction': reported_coverage,
+            'spatial_coverage':  spatial_cov,
+            'time_coverage':     time_coverage,
+            'mean_obs_min':      float(np.mean(obs_mins)),
+            'mean_speed':        float(np.mean(speeds)),
+            'centroid':          self.compute_cluster_centroid().tolist(),
+            'op_phase':          self._op_phase,
+        }
+
+    def build_cluster_report(self) -> dict:
+        """Compile an anonymous ClusterStateReport for General."""
+        summary = self.summarise_coverage()
+        return {
+            'zone_hash':         self.zone_hash,
+            'centroid':          summary['centroid'],
             'health':            self._health,
-            'coverage_fraction': self._coverage_fraction,
-            'scout_count':       len(self._scouts),
+            'coverage_fraction': summary['coverage_fraction'],
+            'scout_count':       summary['scout_count'],
             'collision_risk':    0.0,
             'velocity_mean':     self.vel.tolist(),
             'timestamp':         self._uptime,
-            'op_phase':          self._op_phase,
-            'frames_scouting':   self._frames_scouting,
+            'op_phase':          summary['op_phase'],
+            'mean_obs_min':      summary['mean_obs_min'],
+            'mean_speed':        summary['mean_speed'],
         }
 
     def send_report(self, general) -> None:

@@ -17,7 +17,7 @@ import numpy as np
 # ── Module Constants ──
 
 MIN_ZONE_AREA   = 25.0   # m² — zones smaller than this are never split again
-SPLIT_THRESHOLD = 12     # scout count above which a zone is over-populated
+SPLIT_THRESHOLD = 20     # scout count above which a zone is over-populated
 MERGE_TIMEOUT   = 30.0   # s — how long both zones must be below MIN_DENSITY
 MIN_DENSITY     = 2      # agents — minimum acceptable density per zone
 BOUNDARY_RADIUS = 5.0    # m — radius within which boundary boost activates
@@ -289,12 +289,11 @@ class ZoneMap:
             return False
         if scout_count > SPLIT_THRESHOLD:
             return True
-        if coverage < 0.5 and self.zone_area(zone_hash) > MIN_ZONE_AREA * 2:
+        if collision_risk > 0.85:
             return True
-        if collision_risk > 0.7:
+        if node_health < 0.3:
             return True
-        if node_health < 0.4:
-            return True
+        # coverage < threshold removed — coverage=0 at startup always triggered this
         return False
 
     def needs_merge(

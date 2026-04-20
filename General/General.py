@@ -22,8 +22,9 @@ STATUS_ACTIVE   = 'ACTIVE'
 STATUS_DEGRADED = 'DEGRADED'
 STATUS_SILENT   = 'SILENT'
 
-SILENCE_WARN = 2.0    # s — begin degraded status
-SILENCE_DEAD = 10.0   # s — zone considered silent
+SILENCE_WARN     = 2.0    # s — begin degraded status
+SILENCE_DEAD     = 10.0   # s — zone considered silent
+COVERAGE_TO_TASK = 0.6    # General authorizes Workers when coverage >= this
 
 FSM_PHASES = ['EXPLORE', 'CONVERGE', 'EXECUTE', 'WITHDRAW', 'REBALANCE']
 
@@ -73,14 +74,17 @@ class General:
         for zh in zone_map.active_zones():
             centre = zone_map.get_zone_centre(zh)
             self._world_model[zh] = {
-                'centroid':       np.array([centre[0], centre[1], 3.0]),
-                'health':         1.0,
-                'coverage':       0.0,
-                'scout_count':    0,
-                'collision_risk': 0.0,
-                'status':         STATUS_ACTIVE,
-                'last_seen':      0.0,
-                'silence_timer':  0.0,
+                'centroid':          np.array([centre[0], centre[1], 3.0]),
+                'health':            1.0,
+                'coverage':          0.0,
+                'scout_count':       0,
+                'collision_risk':    0.0,
+                'status':            STATUS_ACTIVE,
+                'last_seen':         0.0,
+                'silence_timer':     0.0,
+                'op_phase':          'SCOUTING',
+                'worker_authorized': False,
+                'mean_obs_min':      9.9,
             }
 
         self._mission_phase:     str               = 'EXPLORE'
@@ -90,34 +94,33 @@ class General:
         self._emit_timer:        float             = 0.0
         self._threat_mask:       int               = 0
         self._uptime:            float             = 0.0
+        self._min_uptime_before_split: float       = 30.0  # no splits in first 30 s
 
     def _build_waypoints(self) -> List[np.ndarray]:
-        """Build 9 waypoints covering far corners, inner ring, and centre."""
-        hw    = self._zone_map.arena_w / 2.0 - 1.0
-        hh    = self._zone_map.arena_h / 2.0 - 1.0
-        mid_w = self._zone_map.arena_w / 4.0
-        mid_h = self._zone_map.arena_h / 4.0
-        alt   = 3.0
-        return [
-            np.array([-hw,    -hh,    alt]),   # far corners — force wide spread
-            np.array([ hw,    -hh,    alt]),
-            np.array([ hw,     hh,    alt]),
-            np.array([-hw,     hh,    alt]),
-            np.array([-mid_w, -mid_h, alt]),   # inner ring
-            np.array([ mid_w, -mid_h, alt]),
-            np.array([ mid_w,  mid_h, alt]),
-            np.array([-mid_w,  mid_h, alt]),
-            np.array([ 0.0,    0.0,   alt]),   # centre last
-        ]
+        """Build 4 corner exploration points per zone, shuffled so zones get variety."""
+        import random
+        waypoints = []
+        for zh in self._zone_map.active_zones():
+            centre = self._zone_map.get_zone_centre(zh)
+            hw = self._zone_map.cell_w * 0.4
+            hh = self._zone_map.cell_h * 0.4
+            waypoints.append(np.array([centre[0] + hw, centre[1] + hh, 3.0]))
+            waypoints.append(np.array([centre[0] - hw, centre[1] + hh, 3.0]))
+            waypoints.append(np.array([centre[0] - hw, centre[1] - hh, 3.0]))
+            waypoints.append(np.array([centre[0] + hw, centre[1] - hh, 3.0]))
+        random.seed(42)
+        random.shuffle(waypoints)
+        return waypoints
 
     # ── World Model ──
 
     def update_zone(self, zone_hash: int, report: dict) -> None:
         """
         Ingest a ClusterStateReport from a Node and update the world model.
+        Authorizes Worker dispatch when coverage crosses COVERAGE_TO_TASK.
 
         Expected report keys: centroid, health, coverage_fraction,
-        scout_count, collision_risk, timestamp.
+        scout_count, collision_risk, timestamp, op_phase, mean_obs_min.
         """
         if zone_hash not in self._world_model:
             active = self._zone_map.active_zones()
@@ -126,33 +129,37 @@ class General:
             else:
                 centre = np.zeros(2)
             self._world_model[zone_hash] = {
-                'centroid':       np.array([centre[0], centre[1], 3.0]),
-                'health':         1.0,
-                'coverage':       0.0,
-                'scout_count':    0,
-                'collision_risk': 0.0,
-                'status':         STATUS_ACTIVE,
-                'last_seen':      0.0,
-                'silence_timer':  0.0,
+                'centroid':          np.array([centre[0], centre[1], 3.0]),
+                'health':            1.0,
+                'coverage':          0.0,
+                'scout_count':       0,
+                'collision_risk':    0.0,
+                'status':            STATUS_ACTIVE,
+                'last_seen':         0.0,
+                'silence_timer':     0.0,
+                'op_phase':          'SCOUTING',
+                'worker_authorized': False,
+                'mean_obs_min':      9.9,
             }
 
         entry = self._world_model[zone_hash]
         if 'centroid' in report:
             c = report['centroid']
             entry['centroid'] = np.array(c) if not isinstance(c, np.ndarray) else c
-        if 'health' in report:
-            entry['health'] = float(report['health'])
-        if 'coverage_fraction' in report:
-            entry['coverage'] = float(report['coverage_fraction'])
-        if 'scout_count' in report:
-            entry['scout_count'] = int(report['scout_count'])
-        if 'collision_risk' in report:
-            entry['collision_risk'] = float(report['collision_risk'])
-        if 'timestamp' in report:
-            entry['last_seen'] = float(report['timestamp'])
-
+        entry['health']        = float(report.get('health',            1.0))
+        entry['coverage']      = float(report.get('coverage_fraction', 0.0))
+        entry['scout_count']   = int(  report.get('scout_count',       0))
+        entry['collision_risk']= float(report.get('collision_risk',    0.0))
+        entry['last_seen']     = self._uptime
         entry['silence_timer'] = 0.0
         entry['status']        = STATUS_ACTIVE
+        entry['op_phase']      = report.get('op_phase',    'SCOUTING')
+        entry['mean_obs_min']  = float(report.get('mean_obs_min', 9.9))
+
+        if entry['coverage'] >= COVERAGE_TO_TASK and not entry['worker_authorized']:
+            entry['worker_authorized'] = True
+            print(f'[General] Zone {zone_hash}: coverage={entry["coverage"]:.2f}'
+                  f' — authorizing Worker dispatch')
 
     def tick_silence_timers(self, dt: float) -> None:
         """
@@ -179,6 +186,24 @@ class General:
     def get_world_model_snapshot(self) -> dict:
         """Return a deep copy of the entire world model for inspection."""
         return copy.deepcopy(self._world_model)
+
+    def is_worker_authorized(self, zone_hash: int) -> bool:
+        """Returns True when General has decided this zone is ready for Workers."""
+        return self._world_model.get(zone_hash, {}).get('worker_authorized', False)
+
+    def get_zone_summary(self) -> dict:
+        """Returns a human-readable summary of currently active zones."""
+        active = set(self._zone_map.active_zones())
+        return {
+            zh: {
+                'coverage':    round(e.get('coverage',          0.0), 2),
+                'op_phase':    e.get('op_phase', '?'),
+                'worker_auth': e.get('worker_authorized', False),
+                'health':      round(e.get('health',            1.0), 2),
+            }
+            for zh, e in self._world_model.items()
+            if zh in active
+        }
 
     # ── Mission Planning ──
 
@@ -262,27 +287,42 @@ class General:
     def broadcast_tokens(self, nodes: List) -> None:
         """
         Emit one GoalToken per active zone and deliver to every node agent.
-        Nodes self-select internally based on their zone_hash.
+        Each zone receives a corner waypoint that is guaranteed != zone centre.
         Gated by emit_timer — fires every emit_interval seconds.
         """
         if not self.should_emit():
             return
+        corners = [
+            np.array([ 1.0,  1.0, 0.0]),
+            np.array([-1.0,  1.0, 0.0]),
+            np.array([-1.0, -1.0, 0.0]),
+            np.array([ 1.0, -1.0, 0.0]),
+        ]
+        corner_cycle = self._wp_index % 4
         for zone_hash in self._zone_map.active_zones():
-            wp   = self.select_next_waypoint()
-            mode = self.select_mode_for_zone(zone_hash)
+            centre = self._zone_map.get_zone_centre(zone_hash)
+            off    = corners[corner_cycle]
+            wp     = np.array([
+                centre[0] + off[0] * self._zone_map.cell_w * 0.38,
+                centre[1] + off[1] * self._zone_map.cell_h * 0.38,
+                3.0,
+            ])
+            mode  = self.select_mode_for_zone(zone_hash)
             token = self.build_goal_token(zone_hash, wp, mode)
             for node in nodes:
                 node.receive_goal_token(token)
+        self._wp_index += 1
 
     def inject_token_direct(self, zone_hash: int, nodes: List) -> bool:
         """
-        Bypasses all timers. Builds a token for zone_hash and delivers
-        it directly to every node in the list. Each node self-selects.
+        Bypasses all timers. Builds a zone-specific token for zone_hash and
+        delivers it directly to every node in the list. Each node self-selects.
         Returns True if at least one node accepted the token.
         """
-        wp    = self.select_next_waypoint()
-        mode  = self.select_mode_for_zone(zone_hash)
-        token = self.build_goal_token(zone_hash, wp, mode)
+        centre = self._zone_map.get_zone_centre(zone_hash)
+        wp     = np.array([centre[0], centre[1], 3.0])
+        mode   = self.select_mode_for_zone(zone_hash)
+        token  = self.build_goal_token(zone_hash, wp, mode)
         accepted = False
         for node in nodes:
             if node.receive_goal_token(token):
@@ -291,25 +331,39 @@ class General:
 
     def seed_all_nodes(self, nodes: List) -> None:
         """
-        Force-delivers one goal token to every active zone.
-        Call once after swarm construction to guarantee every node
-        starts with a valid token. Bypasses emit_timer entirely.
+        Seeds every Node with a goal token pointing to a corner of its zone.
+        The corner is offset from the zone centre so waypoint != node position.
         """
-        for zone_hash in self._zone_map.active_zones():
-            self.inject_token_direct(zone_hash, nodes)
+        corner_offsets = [
+            np.array([ 0.38,  0.38, 0.0]),
+            np.array([-0.38,  0.38, 0.0]),
+            np.array([-0.38, -0.38, 0.0]),
+            np.array([ 0.38, -0.38, 0.0]),
+        ]
+        for i, zone_hash in enumerate(self._zone_map.active_zones()):
+            centre = self._zone_map.get_zone_centre(zone_hash)
+            off    = corner_offsets[i % 4]
+            wp     = np.array([
+                centre[0] + off[0] * self._zone_map.cell_w,
+                centre[1] + off[1] * self._zone_map.cell_h,
+                3.0,
+            ])
+            token = self.build_goal_token(zone_hash, wp, 'SCOUT')
+            for node in nodes:
+                node.receive_goal_token(token)
 
     # ── Zone Topology ──
 
     def check_zone_splits(self) -> None:
         """Inspect every active zone and trigger splits where warranted."""
+        if self._uptime < self._min_uptime_before_split:
+            return
         for zh in list(self._zone_map.active_zones()):
-            entry = self._world_model.get(zh)
-            if entry is None:
-                continue
+            entry = self._world_model.get(zh, {})
             if self._zone_map.needs_split(
                 zh,
                 entry.get('scout_count',    0),
-                entry.get('coverage',       0.0),
+                entry.get('coverage',       1.0),
                 entry.get('collision_risk', 0.0),
                 entry.get('health',         1.0),
             ):
@@ -317,14 +371,17 @@ class General:
                 for ch in (child_a, child_b):
                     centre = self._zone_map.get_zone_centre(ch)
                     self._world_model[ch] = {
-                        'centroid':       np.array([centre[0], centre[1], 3.0]),
-                        'health':         1.0,
-                        'coverage':       0.0,
-                        'scout_count':    0,
-                        'collision_risk': 0.0,
-                        'status':         STATUS_ACTIVE,
-                        'last_seen':      self._uptime,
-                        'silence_timer':  0.0,
+                        'centroid':          np.array([centre[0], centre[1], 3.0]),
+                        'health':            1.0,
+                        'coverage':          0.0,
+                        'scout_count':       0,
+                        'collision_risk':    0.0,
+                        'status':            STATUS_ACTIVE,
+                        'last_seen':         self._uptime,
+                        'silence_timer':     0.0,
+                        'op_phase':          'SCOUTING',
+                        'worker_authorized': False,
+                        'mean_obs_min':      9.9,
                     }
                 self._world_model.pop(zh, None)
 

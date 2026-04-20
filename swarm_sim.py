@@ -440,6 +440,9 @@ def main() -> None:
                 status = swarm.get_swarm_status()
                 hud.update_main(status, dir_ctrl.manual,
                                 dir_ctrl._bias)
+            if frame % (SIM_HZ * 10) == 0:
+                summary = swarm._general._agent.get_zone_summary()
+                print(f'[t={frame//SIM_HZ}s] Zone summary: {summary}')
             if frame % 4 == 0:
                 hud.update_agent_labels(swarm)
 
