@@ -121,6 +121,9 @@ class Node:
         self._min_scout_frames: int   = 60    # wait at least 1 s before TASKING
         self._last_known_coverage: float = 0.0
 
+        self._scout_waypoints: dict = {}  # scout id → current target np.ndarray
+        self._scout_arrived:   dict = {}  # scout id → bool
+
     # ── Downlink from General ──
 
     def receive_goal_token(self, token: dict) -> bool:
@@ -132,10 +135,19 @@ class Node:
             return False
         self._active_token = token
         self._token_age    = 0.0
-        self._mode         = token.get('mode', 'SCOUT')
+        new_mode = token.get('mode', 'SCOUT')
+        self._mode = new_mode
         wp = token.get('waypoint')
-        if wp is not None:
-            self._waypoint = np.array(wp, dtype=float)
+        if new_mode in ('CONVERGE', 'HOLD', 'WITHDRAW'):
+            # General is overriding — use token waypoint directly and
+            # reset patrol state so scouts follow the new direction
+            if wp is not None:
+                self._waypoint = np.array(wp, dtype=float)
+            self._scout_waypoints.clear()
+        else:
+            # SCOUT / DISPERSE — update node waypoint normally
+            if wp is not None:
+                self._waypoint = np.array(wp, dtype=float)
         return True
 
     def token_is_valid(self) -> bool:
@@ -496,49 +508,100 @@ class Node:
             return None
         return self.build_task_command('MOVE_TO', self._waypoint, {})
 
-    def broadcast_scout_commands(self, scouts: List) -> None:
-        """Each Scout gets a unique sub-waypoint so they fan out across the zone."""
+    def assign_scout_patrol_targets(self, scouts: List) -> None:
+        """
+        Assigns each Scout a unique patrol target within this zone.
+        Uses a grid subdivision: divides the zone into NxN cells,
+        assigns one cell centre per Scout, cycling through cells.
+        Only reassigns a Scout when it has arrived at its current target.
+        """
         if not scouts:
             return
-        n = len(scouts)
-        try:
-            radius = min(
-                self._zone_map.cell_w * 0.42,
-                self._zone_map.cell_h * 0.42,
-            )
-        except Exception:
-            radius = 3.5
 
-        w_sep, w_align, w_coh = self.get_effective_weights()
-        if self._mode == 'SCOUT':
-            w_coh   = 0.0
-            w_align = 0.1
-            w_sep   = min(1.0, w_sep + 0.2)
-        w_wp = 0.8
+        try:
+            mn, mx = self._zone_map.get_zone_bounds(self.zone_hash)
+            zw = mx[0] - mn[0]
+            zh = mx[1] - mn[1]
+        except Exception:
+            return
+
+        cell_size = 2.5
+        n_cols = max(2, int(zw / cell_size))
+        n_rows = max(2, int(zh / cell_size))
+        patrol_cells = []
+        for row in range(n_rows):
+            for col in range(n_cols):
+                cx = mn[0] + (col + 0.5) * (zw / n_cols)
+                cy = mn[1] + (row + 0.5) * (zh / n_rows)
+                patrol_cells.append(np.array([cx, cy, 3.0]))
+
+        n_cells = len(patrol_cells)
 
         for i, scout in enumerate(scouts):
-            angle  = 2 * math.pi * i / n
-            r      = radius if i % 2 == 0 else radius * 0.55
-            sub_wp = np.array([
-                self._waypoint[0] + math.cos(angle) * r,
-                self._waypoint[1] + math.sin(angle) * r,
-                3.0,
-            ])
+            scout_key = id(scout)
 
-            wp_pull = sub_wp - scout.pos
-            wp_dist = float(np.linalg.norm(wp_pull))
-            wp_pull = wp_pull / wp_dist if wp_dist > 0.01 else np.zeros(3)
+            if scout_key not in self._scout_waypoints:
+                cell_idx = i % n_cells
+                self._scout_waypoints[scout_key] = patrol_cells[cell_idx].copy()
+                self._scout_waypoints[str(scout_key) + '_cell_idx'] = cell_idx
 
-            other_pos = [s.pos for j, s in enumerate(scouts) if j != i]
-            sep = self.reynolds_separation(other_pos)
+            target = self._scout_waypoints[scout_key]
+            dist = float(np.linalg.norm(scout.pos - target))
+            ARRIVAL = 1.2
 
-            v     = w_sep * sep + w_wp * wp_pull * 2.0
-            speed = float(np.linalg.norm(v))
-            if speed > MAX_SPEED:
-                v = v / speed * MAX_SPEED
-            v[2]  = (3.0 - scout.pos[2]) * 2.0
+            if dist < ARRIVAL:
+                old_idx = self._scout_waypoints.get(str(scout_key) + '_cell_idx', i)
+                stride = max(1, n_cells // len(scouts))
+                new_idx = (old_idx + stride) % n_cells
+                self._scout_waypoints[scout_key] = patrol_cells[new_idx].copy()
+                self._scout_waypoints[str(scout_key) + '_cell_idx'] = new_idx
 
-            scout.receive_velocity_command(self.build_velocity_command(v))
+    def broadcast_scout_commands(self, scouts: List) -> None:
+        """
+        Node's only job now: assign patrol targets.
+        Each scout's behavior class handles its own velocity computation.
+        Node passes neighbor context so behaviors can avoid each other.
+        """
+        if not scouts:
+            return
+
+        self.assign_scout_patrol_targets(scouts)
+
+        try:
+            hw = self._zone_map.arena_w / 2 - 0.5
+            hh = self._zone_map.arena_h / 2 - 0.5
+        except Exception:
+            hw = hh = 9.5
+
+        for i, scout in enumerate(scouts):
+            scout_key = id(scout)
+            target = self._scout_waypoints.get(scout_key, self._waypoint.copy())
+
+            target[0] = float(np.clip(target[0], -hw, hw))
+            target[1] = float(np.clip(target[1], -hh, hh))
+
+            scout._arena_half_w = hw
+            scout._arena_half_h = hh
+
+            if scout._behavior is not None:
+                scout._behavior.set_patrol_target(target)
+
+            neighbors = []
+            for j, other in enumerate(scouts):
+                if j != i:
+                    rel = other.pos - scout.pos
+                    if float(np.linalg.norm(rel)) < 4.0:
+                        neighbors.append(rel)
+
+            cmd = {
+                'v_target':           target.tolist(),
+                'neighbor_positions': [n.tolist() for n in neighbors],
+                'patrol_target':      target.tolist(),
+                'speed_max':          6.0,
+                'ttl':                0.5,
+                'timestamp':          self._uptime,
+            }
+            scout.receive_velocity_command(cmd)
 
     def broadcast_worker_commands(self, workers: List) -> None:
         """

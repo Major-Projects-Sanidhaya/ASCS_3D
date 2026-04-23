@@ -55,6 +55,7 @@ class GeneralController(BaseController):
         self._agent.broadcast_tokens(
             [n._agent for n in self._node_controllers]
         )
+        self._agent.run_llm_step(dt, [n._agent for n in self._node_controllers])
 
     def receive_downlink(self, packet: dict) -> None:
         """No layer exists above General; logs the event."""

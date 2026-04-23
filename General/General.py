@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from General.ZoneMap import ZoneMap
+from intelligence.llm_general import LLMGeneral
 
 # ── Module Constants ──
 
@@ -95,6 +96,11 @@ class General:
         self._threat_mask:       int               = 0
         self._uptime:            float             = 0.0
         self._min_uptime_before_split: float       = 30.0  # no splits in first 30 s
+        self._collective_zone_wp: Dict[int, np.ndarray] = {}  # zone_hash → override wp
+        self._llm: LLMGeneral = LLMGeneral(enabled=True)
+        self._scenario: str = 'default'
+        self._llm_decision_timer: float = 0.0
+        self._llm_decision_interval: float = 15.0
 
     def _build_waypoints(self) -> List[np.ndarray]:
         """Build 4 corner exploration points per zone, shuffled so zones get variety."""
@@ -300,13 +306,16 @@ class General:
         ]
         corner_cycle = self._wp_index % 4
         for zone_hash in self._zone_map.active_zones():
-            centre = self._zone_map.get_zone_centre(zone_hash)
-            off    = corners[corner_cycle]
-            wp     = np.array([
-                centre[0] + off[0] * self._zone_map.cell_w * 0.38,
-                centre[1] + off[1] * self._zone_map.cell_h * 0.38,
-                3.0,
-            ])
+            if zone_hash in self._collective_zone_wp:
+                wp = self._collective_zone_wp[zone_hash].copy()
+            else:
+                centre = self._zone_map.get_zone_centre(zone_hash)
+                off    = corners[corner_cycle]
+                wp     = np.array([
+                    centre[0] + off[0] * self._zone_map.cell_w * 0.38,
+                    centre[1] + off[1] * self._zone_map.cell_h * 0.38,
+                    3.0,
+                ])
             mode  = self.select_mode_for_zone(zone_hash)
             token = self.build_goal_token(zone_hash, wp, mode)
             for node in nodes:
@@ -351,6 +360,115 @@ class General:
             token = self.build_goal_token(zone_hash, wp, 'SCOUT')
             for node in nodes:
                 node.receive_goal_token(token)
+
+    # ── Collective Action Commands ────────────────────────
+
+    def command_collective_converge(self, target: np.ndarray,
+                                     nodes: List) -> None:
+        """
+        Orders ALL nodes to converge on a single point.
+        Used when fire/threat is detected and all assets needed.
+        Overrides individual zone assignments temporarily.
+        """
+        print(f'[General] COLLECTIVE CONVERGE → {np.round(target[:2],1)}')
+        self._mission_phase = 'CONVERGE'
+        for zone_hash in self._zone_map.active_zones():
+            self._collective_zone_wp[zone_hash] = target.copy()
+            token = self.build_goal_token(zone_hash, target, 'CONVERGE')
+            for node in nodes:
+                node.receive_goal_token(token)
+
+    def command_collective_perimeter(self, centre: np.ndarray,
+                                      radius: float,
+                                      nodes: List) -> None:
+        """
+        Spreads nodes evenly around a perimeter circle.
+        Used to surround a fire zone.
+        Each node gets a unique point on the perimeter.
+        """
+        print(f'[General] COLLECTIVE PERIMETER r={radius}m '
+              f'around {np.round(centre[:2],1)}')
+        self._mission_phase = 'EXECUTE'
+        active = self._zone_map.active_zones()
+        n = len(active)
+        for i, zone_hash in enumerate(active):
+            angle = 2 * math.pi * i / n
+            wp = np.array([
+                centre[0] + math.cos(angle) * radius,
+                centre[1] + math.sin(angle) * radius,
+                centre[2],
+            ])
+            self._collective_zone_wp[zone_hash] = wp.copy()
+            token = self.build_goal_token(zone_hash, wp, 'HOLD')
+            for node in nodes:
+                node.receive_goal_token(token)
+
+    def command_return_autonomous(self, nodes: List) -> None:
+        """
+        Releases nodes back to autonomous zone operation.
+        Each node resumes its own ZoneWaypointPlanner.
+        """
+        print('[General] RELEASING to autonomous operation')
+        self._mission_phase = 'EXPLORE'
+        self._collective_zone_wp.clear()
+        self.seed_all_nodes(nodes)
+
+    def run_llm_step(self, dt: float, nodes: List) -> None:
+        """
+        Calls LLM every llm_decision_interval seconds.
+        Translates LLM decision into swarm commands.
+        """
+        self._llm_decision_timer += dt
+        if self._llm_decision_timer < self._llm_decision_interval:
+            return
+        self._llm_decision_timer = 0.0
+
+        summary = self.get_zone_summary()
+        if not summary:
+            return
+
+        decision = self._llm.decide(summary, self._scenario)
+        action = decision.get('action', 'NONE')
+        target_xy = decision.get('target')
+
+        if action == 'CONVERGE' and target_xy:
+            t = np.array([target_xy[0], target_xy[1], 3.0])
+            self.command_collective_converge(t, nodes)
+
+        elif action == 'PERIMETER' and target_xy:
+            t = np.array([target_xy[0], target_xy[1], 3.0])
+            self.command_collective_perimeter(t, 5.0, nodes)
+
+        elif action == 'SCOUT':
+            self.command_return_autonomous(nodes)
+
+        elif action == 'HOLD':
+            for zone_hash in self._zone_map.active_zones():
+                centre = self._zone_map.get_zone_centre(zone_hash)
+                wp = np.array([centre[0], centre[1], 3.0])
+                token = self.build_goal_token(zone_hash, wp, 'HOLD')
+                for node in nodes:
+                    node.receive_goal_token(token)
+
+    def detect_hotspot(self) -> Optional[dict]:
+        """
+        Scans world model for zones with high thermal readings
+        or high collision risk (proxy for fire/obstacle density).
+        Returns the most concerning zone or None.
+        """
+        worst_zone  = None
+        worst_score = 0.0
+        for zh, entry in self._world_model.items():
+            thermal = 1.0 - entry.get('mean_obs_min', 9.9) / 9.9
+            health  = 1.0 - entry.get('health', 1.0)
+            score   = thermal * 0.7 + health * 0.3
+            if score > worst_score:
+                worst_score = score
+                worst_zone  = zh
+        if worst_zone is not None and worst_score > 0.3:
+            return {'zone_hash': worst_zone, 'score': worst_score,
+                    'centroid': self._world_model[worst_zone].get('centroid', [0, 0, 3])}
+        return None
 
     # ── Zone Topology ──
 

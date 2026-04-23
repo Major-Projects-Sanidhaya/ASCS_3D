@@ -134,6 +134,49 @@ class NodeController(BaseController):
 
     # ── Subordinate Registry ──
 
+    def spawn_scout(self, position: np.ndarray,
+                    scout_index: int,
+                    total_in_zone: int,
+                    use_llm: bool = False) -> 'ScoutController':
+        """
+        Spawns a new Scout at position, generates its unique behavior,
+        wires it to this Node, and registers it.
+        Returns the new ScoutController.
+        """
+        from Scout.behavior_generator import generate_behavior
+        from controllers.scout_controller import ScoutController
+
+        sc = ScoutController(position, self._agent)
+
+        behavior_class = generate_behavior(
+            scout_id             = sc._agent.scout_id,
+            zone_hash            = self._agent.zone_hash,
+            scout_index          = scout_index,
+            total_scouts_in_zone = total_in_zone,
+            use_llm              = use_llm,
+            llm_context          = f'zone {self._agent.zone_hash} scout {scout_index}',
+        )
+        behavior = behavior_class(
+            scout_id      = sc._agent.scout_id,
+            zone_hash     = self._agent.zone_hash,
+            patrol_target = self._agent._waypoint.copy(),
+        )
+        sc._agent.assign_behavior(behavior)
+        self.register_scout(sc)
+        print(f'[Node {self._agent.zone_hash}] Spawned scout '
+              f'{sc._agent.scout_id} with {behavior_class.__name__}')
+        return sc
+
+    def despawn_scout(self, scout_ctrl: 'ScoutController') -> None:
+        """Removes a scout from this Node. Destroys its behavior file."""
+        sc = scout_ctrl._agent
+        sc.destroy()
+        if scout_ctrl in self._scout_controllers:
+            self._scout_controllers.remove(scout_ctrl)
+        if sc in self._agent._scouts:
+            self._agent._scouts.remove(sc)
+        print(f'[Node {self._agent.zone_hash}] Despawned scout {sc.scout_id}')
+
     def register_scout(self, scout_ctrl) -> None:
         """Register a ScoutController so its agent participates each tick."""
         self._scout_controllers.append(scout_ctrl)

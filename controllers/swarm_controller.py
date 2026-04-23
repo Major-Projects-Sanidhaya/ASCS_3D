@@ -14,7 +14,6 @@ import numpy as np
 
 from controllers.general_controller import GeneralController
 from controllers.node_controller import NodeController
-from controllers.scout_controller import ScoutController
 from controllers.worker_controller import WorkerController
 from General.ZoneMap import ZoneMap
 
@@ -54,7 +53,9 @@ class SwarmController:
         self._n_scouts  = config.get('n_scouts_per_node', 4)
         self._n_workers = config.get('n_workers_per_node',1)
 
+        self._config   = config
         self._zone_map = ZoneMap(arena_w, arena_h, grid_cols, grid_rows)
+        self._clear_generated_behaviors()
 
         self._general = GeneralController(
             np.array([0.0, 0.0, self._altitude + 2.0]),
@@ -81,6 +82,22 @@ class SwarmController:
 
         self._gui_weights: dict = {}
         self._step_count:  int  = 0
+
+    @staticmethod
+    def _clear_generated_behaviors() -> None:
+        """Delete all previously generated behavior files at startup."""
+        import os
+        gen_dir = os.path.join(os.path.dirname(__file__),
+                               '..', 'Scout', '_generated')
+        gen_dir = os.path.normpath(gen_dir)
+        if not os.path.isdir(gen_dir):
+            return
+        for fname in os.listdir(gen_dir):
+            if fname.startswith('behavior_') and fname.endswith('.py'):
+                try:
+                    os.remove(os.path.join(gen_dir, fname))
+                except OSError:
+                    pass
 
     # ── Main Loop ──
 
@@ -121,6 +138,7 @@ class SwarmController:
         node_pos = np.array([centre[0], centre[1], self._altitude])
         node     = NodeController(node_pos, self._zone_map, zone_hash)
 
+        use_llm = self._config.get('use_llm_scouts', False)
         for i in range(self._n_scouts):
             angle = 2 * math.pi * i / max(self._n_scouts, 1)
             pos   = node_pos + np.array([
@@ -128,8 +146,7 @@ class SwarmController:
                 math.sin(angle) * 1.5,
                 0.0,
             ])
-            sc = ScoutController(pos, node._agent)
-            node.register_scout(sc)
+            sc = node.spawn_scout(pos, i, self._n_scouts, use_llm=use_llm)
             self._scouts.append(sc)
 
         for i in range(self._n_workers):
@@ -158,6 +175,112 @@ class SwarmController:
             if wc in self._workers:
                 self._workers.remove(wc)
         del self._nodes[zone_hash]
+
+    def add_node(self, zone_hash: int) -> Optional[NodeController]:
+        """Adds a new Node for an existing zone_hash with fresh scouts/workers."""
+        if zone_hash in self._nodes:
+            print(f'[Swarm] Node already exists for zone {zone_hash}')
+            return None
+        if zone_hash not in self._zone_map.active_zones():
+            print(f'[Swarm] Zone {zone_hash} is not active')
+            return None
+        node = self.spawn_node(zone_hash)
+        self._general.register_node(node)
+        self._general._agent.seed_all_nodes(
+            [n._agent for n in self._nodes.values()])
+        print(f'[Swarm] Added Node for zone {zone_hash}  '
+              f'total_nodes={len(self._nodes)}')
+        return node
+
+    def remove_node(self, zone_hash: int) -> bool:
+        """Removes a Node and reassigns its scouts/workers to the nearest Node."""
+        if zone_hash not in self._nodes:
+            print(f'[Swarm] No Node for zone {zone_hash}')
+            return False
+        if len(self._nodes) <= 1:
+            print('[Swarm] Cannot remove last Node')
+            return False
+
+        dying_node = self._nodes[zone_hash]
+        dying_pos  = dying_node._agent.pos.copy()
+
+        nearest = min(
+            [(zh, nc) for zh, nc in self._nodes.items() if zh != zone_hash],
+            key=lambda x: float(np.linalg.norm(x[1]._agent.pos - dying_pos))
+        )
+        target_zh, target_nc = nearest
+        print(f'[Swarm] Removing Node {zone_hash} → reassigning to Node {target_zh}')
+
+        for sc in list(dying_node._scout_controllers):
+            spawn_pos = sc._agent.pos.copy()
+            dying_node.despawn_scout(sc)
+            if sc in self._scouts:
+                self._scouts.remove(sc)
+            idx    = len(target_nc._scout_controllers)
+            new_sc = target_nc.spawn_scout(spawn_pos, idx, idx + 1)
+            self._scouts.append(new_sc)
+
+        for wc in list(dying_node._worker_controllers):
+            target_nc.register_worker(wc)
+
+        if dying_node in self._general._node_controllers:
+            self._general._node_controllers.remove(dying_node)
+        del self._nodes[zone_hash]
+
+        print(f'[Swarm] Node {zone_hash} removed. '
+              f'Remaining nodes: {list(self._nodes.keys())}')
+        return True
+
+    def add_scout(self, zone_hash: int,
+                  position: Optional[np.ndarray] = None) -> Optional[object]:
+        """Adds one more Scout to an existing Node."""
+        if zone_hash not in self._nodes:
+            print(f'[Swarm] No Node for zone {zone_hash}')
+            return None
+        node = self._nodes[zone_hash]
+        if position is None:
+            import random
+            angle    = random.uniform(0, 2 * math.pi)
+            position = node._agent.pos + np.array([
+                math.cos(angle) * 1.5,
+                math.sin(angle) * 1.5,
+                0.0,
+            ])
+        idx = len(node._scout_controllers)
+        sc  = node.spawn_scout(position, idx, idx + 1,
+                               use_llm=self._config.get('use_llm_scouts', False))
+        self._scouts.append(sc)
+        print(f'[Swarm] Added Scout {sc._agent.scout_id} to Node {zone_hash}  '
+              f'total_in_zone={len(node._scout_controllers)}')
+        return sc
+
+    def remove_scout(self, scout_ctrl) -> bool:
+        """Removes a specific Scout and destroys its behavior file."""
+        owner = None
+        for nc in self._nodes.values():
+            if scout_ctrl in nc._scout_controllers:
+                owner = nc
+                break
+        if owner is None:
+            print('[Swarm] Scout not found in any Node')
+            return False
+        sid = scout_ctrl._agent.scout_id
+        owner.despawn_scout(scout_ctrl)
+        if scout_ctrl in self._scouts:
+            self._scouts.remove(scout_ctrl)
+        print(f'[Swarm] Removed Scout {sid}')
+        return True
+
+    def get_swarm_topology(self) -> dict:
+        """Returns current node/scout/worker counts per zone."""
+        return {
+            zh: {
+                'scouts':   len(nc._scout_controllers),
+                'workers':  len(nc._worker_controllers),
+                'node_pos': nc._agent.pos[:2].tolist(),
+            }
+            for zh, nc in self._nodes.items()
+        }
 
     # ── Status ──
 

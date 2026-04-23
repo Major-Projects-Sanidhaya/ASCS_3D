@@ -1,3 +1,4 @@
+import argparse
 import pybullet as p
 import pybullet_data
 import numpy as np
@@ -8,16 +9,93 @@ from controllers.swarm_controller import SwarmController
 from logger.movement_logger import MovementLogger
 
 # ── Config ────────────────────────────────────────────────────────────────────
-SWARM_CONFIG = {
-    'arena_w':            20.0,
-    'arena_h':            20.0,
-    'grid_cols':          2,
-    'grid_rows':          2,
-    'n_scouts_per_node':  4,
-    'n_workers_per_node': 1,
-    'altitude':           3.0,
-    'emit_interval':      5.0,
-}
+
+def build_config() -> dict:
+    parser = argparse.ArgumentParser(
+        description='ASCS_3D — Anonymous Drone Swarm\n'
+                    'Use cases: house fire, forest fire, search & rescue\n',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument('--arena-w',   type=float, default=20.0,
+        help='Arena width  in metres (default: 20)')
+    parser.add_argument('--arena-h',   type=float, default=20.0,
+        help='Arena height in metres (default: 20)')
+    parser.add_argument('--grid-cols', type=int,   default=2,
+        help='Zone grid columns (default: 2 → 4 nodes for 20m arena)')
+    parser.add_argument('--grid-rows', type=int,   default=2,
+        help='Zone grid rows    (default: 2)')
+    parser.add_argument('--scouts',    type=int,   default=4,
+        help='Scouts per node   (default: 4)')
+    parser.add_argument('--workers',   type=int,   default=1,
+        help='Workers per node  (default: 1)')
+    parser.add_argument('--altitude',  type=float, default=3.0,
+        help='Flight altitude   (default: 3.0m)')
+    parser.add_argument('--emit-interval', type=float, default=5.0,
+        help='Goal token emit interval in seconds (default: 5)')
+    parser.add_argument('--scenario',  type=str,   default='default',
+        choices=['default', 'house_fire', 'forest_fire', 'search_rescue'],
+        help='Mission scenario preset')
+    parser.add_argument('--llm-scouts', action='store_true',
+        help='Generate scout behaviors via Ollama LLM (requires ollama serve)')
+    args = parser.parse_args()
+
+    presets = {
+        'house_fire': {
+            'arena_w': 15.0, 'arena_h': 15.0,
+            'grid_cols': 2,  'grid_rows': 2,
+            'n_scouts_per_node': 3, 'n_workers_per_node': 2,
+            'altitude': 2.0,
+            'emit_interval': 3.0
+        },
+        'forest_fire': {
+            'arena_w': 100.0, 'arena_h': 100.0,
+            'grid_cols': 4,   'grid_rows': 4,
+            'n_scouts_per_node': 6, 'n_workers_per_node': 2,
+            'altitude': 8.0,
+            'emit_interval': 8.0
+        },
+        'search_rescue': {
+            'arena_w': 50.0, 'arena_h': 50.0,
+            'grid_cols': 3,  'grid_rows': 3,
+            'n_scouts_per_node': 5, 'n_workers_per_node': 2,
+            'altitude': 5.0,
+            'emit_interval': 6.0
+        },
+    }
+
+    if args.scenario != 'default' and args.scenario in presets:
+        cfg = presets[args.scenario]
+        print(f'[Config] Scenario: {args.scenario}')
+    else:
+        cfg = {
+            'arena_w':            args.arena_w,
+            'arena_h':            args.arena_h,
+            'grid_cols':          args.grid_cols,
+            'grid_rows':          args.grid_rows,
+            'n_scouts_per_node':  args.scouts,
+            'n_workers_per_node': args.workers,
+            'altitude':           args.altitude,
+            'emit_interval':      args.emit_interval,
+        }
+
+    max_zone_w = cfg['arena_w'] / cfg['grid_cols']
+    max_zone_h = cfg['arena_h'] / cfg['grid_rows']
+    if max_zone_w > 35 or max_zone_h > 35:
+        suggested_cols = max(2, math.ceil(cfg['arena_w'] / 30))
+        suggested_rows = max(2, math.ceil(cfg['arena_h'] / 30))
+        print(f'[Config] WARNING: Zone size {max_zone_w:.0f}x{max_zone_h:.0f}m '
+              f'exceeds UWB range. Suggest --grid-cols {suggested_cols} '
+              f'--grid-rows {suggested_rows}')
+
+    n_nodes   = cfg['grid_cols'] * cfg['grid_rows']
+    n_scouts  = n_nodes * cfg['n_scouts_per_node']
+    n_workers = n_nodes * cfg['n_workers_per_node']
+    print(f'[Config] Arena: {cfg["arena_w"]}x{cfg["arena_h"]}m  '
+          f'Zones: {n_nodes}  Scouts: {n_scouts}  Workers: {n_workers}  '
+          f'Alt: {cfg["altitude"]}m')
+    cfg['scenario']        = args.scenario
+    cfg['use_llm_scouts']  = args.llm_scouts
+    return cfg
 
 SIM_HZ   = 60
 COLORS   = {
@@ -97,8 +175,8 @@ def read_sliders(sliders: Dict[str, int]) -> Dict[str, float]:
 
 def add_arena_markers(swarm: SwarmController) -> None:
     """Draw zone grid on the ground and waypoint discs."""
-    cfg = SWARM_CONFIG
-    hw, hh = cfg['arena_w'] / 2, cfg['arena_h'] / 2
+    zm = swarm._zone_map
+    hw, hh = zm.arena_w / 2, zm.arena_h / 2
 
     # Arena boundary
     corners = [[-hw,-hh,0],[ hw,-hh,0],[ hw, hh,0],[-hw, hh,0],[-hw,-hh,0]]
@@ -107,8 +185,8 @@ def add_arena_markers(swarm: SwarmController) -> None:
                 corners[i], corners[i+1], [0.3,0.3,0.3], 0.5)
 
     # Zone grid lines
-    cols, rows = cfg['grid_cols'], cfg['grid_rows']
-    cw, ch = cfg['arena_w']/cols, cfg['arena_h']/rows
+    cols, rows = zm.grid_cols, zm.grid_rows
+    cw, ch = zm.arena_w / cols, zm.arena_h / rows
     for i in range(1, cols):
         x = -hw + i * cw
         pb_safe(p.addUserDebugLine, [x,-hh,0],[x, hh,0],[0.2,0.2,0.3],0.4)
@@ -186,7 +264,9 @@ class HUD:
             f'Debug overlay: {self.mode}  (TAB to cycle)',
             self.HUD_MODE, [0.6, 0.6, 0.8], 0.9)
         ctrl = ('MANUAL: W/S=fwd/bk  A/D=left/right  Q/E=alt  R=reset  '
-                'SPACE=auto') if manual else 'SPACE=manual mode  TAB=debug overlay'
+                'SPACE=auto') if manual else (
+                'C=converge  P=perimeter  U=auto  '
+                '==add_scout  -=remove_scout  SPACE=manual  TAB=debug')
         self._set('keys', ctrl, self.HUD_KEYS, [0.5, 0.5, 0.5], 0.8)
 
     def update_agent_labels(self, swarm: SwarmController) -> None:
@@ -289,16 +369,25 @@ class DirectionController:
     KEY_R     = ord('r')
     KEY_SPACE = ord(' ')
     KEY_TAB   = 9
+    KEY_C     = ord('c')
+    KEY_P     = ord('p')
+    KEY_U     = ord('u')
+    KEY_PLUS  = ord('=')
+    KEY_MINUS = ord('-')
     STEP      = 0.12
     ALT_STEP  = 0.05
 
     def __init__(self, arena_w: float, arena_h: float,
                  default_alt: float):
-        self._arena_w  = arena_w
-        self._arena_h  = arena_h
-        self._bias     = np.zeros(2)
-        self._alt      = default_alt
-        self._manual   = False
+        self._arena_w     = arena_w
+        self._arena_h     = arena_h
+        self._bias        = np.zeros(2)
+        self._alt         = default_alt
+        self._default_alt = default_alt
+        self._manual      = False
+        self._add_zone_idx   = 0
+        self.pending_spawns  = []
+        self.pending_despawns = []
 
     @property
     def manual(self) -> bool:
@@ -328,7 +417,52 @@ class DirectionController:
         if (self.KEY_R in keys
                 and keys[self.KEY_R] & p.KEY_WAS_TRIGGERED):
             self._bias  = np.zeros(2)
-            self._alt   = SWARM_CONFIG['altitude']
+            self._alt   = self._default_alt
+
+        # Collective converge to arena centre
+        if (self.KEY_C in keys
+                and keys[self.KEY_C] & p.KEY_WAS_TRIGGERED):
+            centre = np.array([0.0, 0.0, swarm._altitude])
+            swarm._general._agent.command_collective_converge(
+                centre, [n._agent for n in swarm._nodes.values()])
+
+        # Collective perimeter around detected hotspot
+        if (self.KEY_P in keys
+                and keys[self.KEY_P] & p.KEY_WAS_TRIGGERED):
+            hotspot = swarm._general._agent.detect_hotspot()
+            if hotspot:
+                c = hotspot['centroid']
+                centre = np.array([c[0], c[1], swarm._altitude])
+                swarm._general._agent.command_collective_perimeter(
+                    centre, 5.0,
+                    [n._agent for n in swarm._nodes.values()])
+            else:
+                print('[Manual] No hotspot detected')
+
+        # Return all nodes to autonomous operation
+        if (self.KEY_U in keys
+                and keys[self.KEY_U] & p.KEY_WAS_TRIGGERED):
+            swarm._general._agent.command_return_autonomous(
+                [n._agent for n in swarm._nodes.values()])
+
+        # Add a scout to the next zone (cycling)
+        if (self.KEY_PLUS in keys
+                and keys[self.KEY_PLUS] & p.KEY_WAS_TRIGGERED):
+            zones = list(swarm._nodes.keys())
+            if zones:
+                zh    = zones[self._add_zone_idx % len(zones)]
+                new_sc = swarm.add_scout(zh)
+                if new_sc:
+                    self.pending_spawns.append(('scouts', new_sc))
+                self._add_zone_idx += 1
+
+        # Remove the most recently added scout
+        if (self.KEY_MINUS in keys
+                and keys[self.KEY_MINUS] & p.KEY_WAS_TRIGGERED):
+            if swarm._scouts:
+                sc = swarm._scouts[-1]
+                swarm.remove_scout(sc)
+                self.pending_despawns.append(sc)
 
         if self._manual:
             hw = self._arena_w / 2 - 1.5
@@ -387,16 +521,18 @@ def draw_hierarchy_lines(swarm: SwarmController) -> None:
 def main() -> None:
     setup_pybullet()
 
-    swarm  = SwarmController(SWARM_CONFIG)
+    cfg    = build_config()
+    swarm  = SwarmController(cfg)
+    swarm._general._agent._scenario = cfg.get('scenario', 'default')
     bodies = create_drone_bodies(swarm)
     sliders = setup_sliders()
     add_arena_markers(swarm)
 
     hud      = HUD()
     dir_ctrl = DirectionController(
-        SWARM_CONFIG['arena_w'],
-        SWARM_CONFIG['arena_h'],
-        SWARM_CONFIG['altitude'],
+        cfg['arena_w'],
+        cfg['arena_h'],
+        cfg['altitude'],
     )
 
     logger = MovementLogger('logs')
@@ -424,6 +560,18 @@ def main() -> None:
 
             # ── 2. Keyboard + directional control ─────────
             dir_ctrl.process(swarm, hud)
+
+            # ── 2b. Dynamic spawn/despawn bodies ──────────
+            for tier, ctrl in dir_ctrl.pending_spawns:
+                pos = ctrl._agent.pos.tolist()
+                r   = RADII[tier]
+                vis = p.createVisualShape(p.GEOM_SPHERE, radius=r,
+                                          rgbaColor=COLORS[tier])
+                col = p.createCollisionShape(p.GEOM_SPHERE, radius=r)
+                bid = p.createMultiBody(0, col, vis, pos)
+                bodies.setdefault(tier, []).append(bid)
+            dir_ctrl.pending_spawns.clear()
+            dir_ctrl.pending_despawns.clear()
 
             # ── 3. Step simulation ─────────────────────────
             swarm.step(dt)

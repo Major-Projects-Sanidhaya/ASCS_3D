@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import uuid
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -62,6 +63,10 @@ class Scout:
         self._battery:  float          = 1.0
         self._uptime:   float          = 0.0
         self._seq:      int            = 0
+        self._arena_half_w: float      = 9.5
+        self._arena_half_h: float      = 9.5
+        self.scout_id: str             = f'scout_{uuid.uuid4().hex[:8]}'
+        self._behavior: Optional[object] = None
 
     # ── Sensor Simulation ──
 
@@ -186,38 +191,64 @@ class Scout:
         ])
         return np.clip(m, 0.0, 1.0)
 
+    # ── Behavior Assignment ──
+
+    def assign_behavior(self, behavior_instance) -> None:
+        """Called by Node after spawn. Sets the autonomous behavior."""
+        self._behavior = behavior_instance
+
+    def destroy(self) -> None:
+        """Called when this scout is removed from the swarm."""
+        if self._behavior is not None:
+            self._behavior.on_destroy()
+        from Scout.behavior_generator import destroy_behavior
+        destroy_behavior(self.scout_id)
+        self._behavior = None
+
     # ── Position Update ──
 
     def update_position(self, dt: float) -> None:
-        """
-        Advance Scout position by one simulation tick.
+        neighbor_pos = []
+        if self._last_cmd is not None:
+            neighbor_pos = [np.array(p, dtype=float)
+                            for p in self._last_cmd.get('neighbor_positions', [])]
 
-        If a fresh VelocityCommand is available, track it with PID.
-        Otherwise enter loiter: kill lateral velocity, hold altitude.
-        """
-        if self._last_cmd is not None and self._cmd_age < LOITER_TIMEOUT:
-            v_target = np.array(self._last_cmd['v_target'], dtype=float)
-            _, obs_min = self.read_tof_obstacle()
-            if obs_min < OBS_REFLEX_M:
-                self.vel = -self.heading * MAX_SPEED
-            else:
-                self.pid_update(v_target, dt)
+        _, obs_min = self.read_tof_obstacle()
+
+        if self._behavior is not None:
+            v = self._behavior.compute_velocity(
+                pos          = self.pos.copy(),
+                vel          = self.vel.copy(),
+                neighbor_pos = neighbor_pos,
+                obs_min      = float(obs_min),
+                arena_hw     = self._arena_half_w,
+                arena_hh     = self._arena_half_h,
+            )
+            self._behavior.tick(self.pos)
+            self._behavior.update_arrival(self.pos)
+            self.vel = v
         else:
-            self.vel[:2] *= 0.9
-            self.vel[2]   = self.altitude_hold(float(self.pos[2]))
+            if self._last_cmd is not None and self._cmd_age < 0.5:
+                v_target = np.array(self._last_cmd.get('v_target', [0, 0, 3]))
+                self.pid_update(v_target, dt)
+            else:
+                self.vel[:2] *= 0.7
+                self.vel[2]   = self.altitude_hold(self.pos[2])
+
+        # Safety reflex overrides behavior
+        if obs_min < 0.5:
+            speed = float(np.linalg.norm(self.vel))
+            if speed > 0.1:
+                self.vel = -self.vel / speed * 2.0
 
         self.pos    += self.vel * dt
-        self.pos[0]  = float(np.clip(self.pos[0], -9.5, 9.5))
-        self.pos[1]  = float(np.clip(self.pos[1], -9.5, 9.5))
+        self.pos[0]  = float(np.clip(self.pos[0], -self._arena_half_w, self._arena_half_w))
+        self.pos[1]  = float(np.clip(self.pos[1], -self._arena_half_h, self._arena_half_h))
         self.pos[2]  = float(np.clip(self.pos[2],  0.3, 9.0))
 
-        horiz_speed = float(np.linalg.norm(self.vel[:2]))
-        if horiz_speed > 1e-3:
-            self.heading = np.array([
-                self.vel[0] / horiz_speed,
-                self.vel[1] / horiz_speed,
-                0.0,
-            ])
+        speed = float(np.linalg.norm(self.vel[:2]))
+        if speed > 1e-3:
+            self.heading = np.array([self.vel[0], self.vel[1], 0.0]) / speed
 
         self._cmd_age += dt
         self._uptime  += dt

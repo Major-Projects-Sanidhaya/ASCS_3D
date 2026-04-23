@@ -68,6 +68,8 @@ class Worker:
         self._battery:     float    = 1.0
         self._uptime:      float    = 0.0
         self._seq:         int      = 0
+        self._arena_half_w: float   = 9.5
+        self._arena_half_h: float   = 9.5
 
     # ── Sensor Simulation ──
 
@@ -245,8 +247,8 @@ class Worker:
             if horiz > 0.5:
                 self.vel[:2] = self.vel[:2] / horiz * 0.5
             self.pos += self.vel * dt
-            self.pos[0] = float(np.clip(self.pos[0], -9.5, 9.5))
-            self.pos[1] = float(np.clip(self.pos[1], -9.5, 9.5))
+            self.pos[0] = float(np.clip(self.pos[0], -self._arena_half_w, self._arena_half_w))
+            self.pos[1] = float(np.clip(self.pos[1], -self._arena_half_h, self._arena_half_h))
             self.pos[2] = float(np.clip(self.pos[2],  0.3, 9.0))
             return
 
@@ -272,8 +274,8 @@ class Worker:
             self.vel[:2] = self.vel[:2] / speed * MAX_SPEED
 
         self.pos += self.vel * dt
-        self.pos[0] = float(np.clip(self.pos[0], -9.5, 9.5))
-        self.pos[1] = float(np.clip(self.pos[1], -9.5, 9.5))
+        self.pos[0] = float(np.clip(self.pos[0], -self._arena_half_w, self._arena_half_w))
+        self.pos[1] = float(np.clip(self.pos[1], -self._arena_half_h, self._arena_half_h))
         self.pos[2] = float(np.clip(self.pos[2],  0.3, 9.0))
 
         horiz_speed = float(np.linalg.norm(self.vel[:2]))
