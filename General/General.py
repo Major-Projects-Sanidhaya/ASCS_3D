@@ -415,8 +415,7 @@ class General:
 
     def run_llm_step(self, dt: float, nodes: List) -> None:
         """
-        Calls LLM every llm_decision_interval seconds.
-        Translates LLM decision into swarm commands.
+        Called every step. Fires LLM every llm_decision_interval seconds.
         """
         self._llm_decision_timer += dt
         if self._llm_decision_timer < self._llm_decision_interval:
@@ -428,8 +427,11 @@ class General:
             return
 
         decision = self._llm.decide(summary, self._scenario)
-        action = decision.get('action', 'NONE')
-        target_xy = decision.get('target')
+        self._apply_decision(decision, nodes)
+
+    def _apply_decision(self, decision: dict, nodes: List) -> None:
+        action    = decision.get('action', 'NONE')
+        target_xy = decision.get('target_xy')
 
         if action == 'CONVERGE' and target_xy:
             t = np.array([target_xy[0], target_xy[1], 3.0])
@@ -442,13 +444,15 @@ class General:
         elif action == 'SCOUT':
             self.command_return_autonomous(nodes)
 
-        elif action == 'HOLD':
-            for zone_hash in self._zone_map.active_zones():
-                centre = self._zone_map.get_zone_centre(zone_hash)
+        elif action == 'WITHDRAW':
+            for zh in self._zone_map.active_zones():
+                centre = self._zone_map.get_zone_centre(zh)
                 wp = np.array([centre[0], centre[1], 3.0])
-                token = self.build_goal_token(zone_hash, wp, 'HOLD')
+                token = self.build_goal_token(zh, wp, 'WITHDRAW')
                 for node in nodes:
                     node.receive_goal_token(token)
+
+        # HOLD and NONE: no change to node waypoints
 
     def detect_hotspot(self) -> Optional[dict]:
         """

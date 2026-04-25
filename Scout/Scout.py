@@ -67,6 +67,8 @@ class Scout:
         self._arena_half_h: float      = 9.5
         self.scout_id: str             = f'scout_{uuid.uuid4().hex[:8]}'
         self._behavior: Optional[object] = None
+        self._physics_backend: str     = 'simple'
+        self._physics                  = None   # lazily created on first update_position
 
     # ── Sensor Simulation ──
 
@@ -193,6 +195,13 @@ class Scout:
 
     # ── Behavior Assignment ──
 
+    def set_physics_backend(self, backend: str, **kwargs) -> None:
+        """Call before first step to choose physics backend."""
+        self._physics_backend = backend
+        from physics import get_physics
+        self._physics = get_physics(backend, **kwargs)
+        self._physics.reset(self.pos, self.vel)
+
     def assign_behavior(self, behavior_instance) -> None:
         """Called by Node after spawn. Sets the autonomous behavior."""
         self._behavior = behavior_instance
@@ -226,7 +235,6 @@ class Scout:
             )
             self._behavior.tick(self.pos)
             self._behavior.update_arrival(self.pos)
-            self.vel = v
         else:
             if self._last_cmd is not None and self._cmd_age < 0.5:
                 v_target = np.array(self._last_cmd.get('v_target', [0, 0, 3]))
@@ -234,14 +242,24 @@ class Scout:
             else:
                 self.vel[:2] *= 0.7
                 self.vel[2]   = self.altitude_hold(self.pos[2])
+            v = self.vel.copy()
 
         # Safety reflex overrides behavior
         if obs_min < 0.5:
-            speed = float(np.linalg.norm(self.vel))
+            speed = float(np.linalg.norm(v))
             if speed > 0.1:
-                self.vel = -self.vel / speed * 2.0
+                v = -v / speed * 2.0
 
-        self.pos    += self.vel * dt
+        # Lazy init physics backend
+        if self._physics is None:
+            from physics.simple_physics import SimplePhysics
+            self._physics = SimplePhysics()
+            self._physics.reset(self.pos, self.vel)
+
+        new_pos, new_vel = self._physics.step(v, dt)
+        self.pos = new_pos
+        self.vel = new_vel
+
         self.pos[0]  = float(np.clip(self.pos[0], -self._arena_half_w, self._arena_half_w))
         self.pos[1]  = float(np.clip(self.pos[1], -self._arena_half_h, self._arena_half_h))
         self.pos[2]  = float(np.clip(self.pos[2],  0.3, 9.0))

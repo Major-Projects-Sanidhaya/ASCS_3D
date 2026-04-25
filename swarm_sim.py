@@ -37,6 +37,9 @@ def build_config() -> dict:
         help='Mission scenario preset')
     parser.add_argument('--llm-scouts', action='store_true',
         help='Generate scout behaviors via Ollama LLM (requires ollama serve)')
+    parser.add_argument('--physics', default='simple',
+        choices=['simple', 'pyflyt'],
+        help='Physics backend for drone flight dynamics (default: simple)')
     args = parser.parse_args()
 
     presets = {
@@ -95,6 +98,7 @@ def build_config() -> dict:
           f'Alt: {cfg["altitude"]}m')
     cfg['scenario']        = args.scenario
     cfg['use_llm_scouts']  = args.llm_scouts
+    cfg['physics']         = args.physics
     return cfg
 
 SIM_HZ   = 60
@@ -524,6 +528,15 @@ def main() -> None:
     cfg    = build_config()
     swarm  = SwarmController(cfg)
     swarm._general._agent._scenario = cfg.get('scenario', 'default')
+
+    physics_backend = cfg.get('physics', 'simple')
+    if physics_backend == 'pyflyt':
+        print('[Physics] Using PyFlyt quadrotor dynamics')
+        for sc in swarm._scouts:
+            sc._agent.set_physics_backend('pyflyt', mass=0.03, arm_length=0.03)
+    else:
+        print('[Physics] Using simple PID dynamics')
+
     bodies = create_drone_bodies(swarm)
     sliders = setup_sliders()
     add_arena_markers(swarm)

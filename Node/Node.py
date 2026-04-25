@@ -124,6 +124,12 @@ class Node:
         self._scout_waypoints: dict = {}  # scout id → current target np.ndarray
         self._scout_arrived:   dict = {}  # scout id → bool
 
+        from intelligence.llm_node import LLMNode
+        self._llm_node           = LLMNode(zone_hash=zone_hash, enabled=True)
+        self._llm_node_timer:  float = 0.0
+        self._llm_node_interval: float = 30.0
+        self._scenario: str      = 'default'
+
     # ── Downlink from General ──
 
     def receive_goal_token(self, token: dict) -> bool:
@@ -707,6 +713,42 @@ class Node:
         """Deliver the cluster report to the General agent."""
         general.update_zone(self.zone_hash, self.build_cluster_report())
 
+    # ── LLM Tactical Layer ──
+
+    def run_llm_step(self, dt: float) -> None:
+        """
+        Called every step. Fires LLM every llm_node_interval seconds.
+        Node acts independently — no coordination with other nodes.
+        """
+        self._llm_node_timer += dt
+        if self._llm_node_timer < self._llm_node_interval:
+            return
+        self._llm_node_timer = 0.0
+
+        summary = self.summarise_coverage()
+        advice  = self._llm_node.advise(
+            zone_hash       = self.zone_hash,
+            coverage        = summary['coverage_fraction'],
+            scout_count     = summary['scout_count'],
+            mean_speed      = summary['mean_speed'],
+            op_phase        = self._op_phase,
+            frames_scouting = self._frames_scouting,
+            scenario        = self._scenario,
+        )
+
+        ds = advice.get('adjust_sep',   0.0)
+        da = advice.get('adjust_align', 0.0)
+        dc = advice.get('adjust_coh',   0.0)
+        self.set_rl_offsets(
+            self._delta_sep   + ds,
+            self._delta_align + da,
+            self._delta_coh   + dc,
+        )
+
+        mode = advice.get('patrol_mode')
+        if mode and mode in ('SCOUT', 'HOLD', 'CONVERGE'):
+            self._mode = mode
+
     # ── Motion ──
 
     def update_position(self, dt: float) -> None:
@@ -719,6 +761,7 @@ class Node:
         self.pos[2] = max(0.5, float(self.pos[2]))
         self._uptime   += dt
         self._token_age += dt
+        self.run_llm_step(dt)
 
     # ── Degradation ──
 

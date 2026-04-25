@@ -80,6 +80,8 @@ class SwarmController:
         # Give Nodes a back-reference so they can query General authorization.
         self._zone_map._general_ref = self._general._agent
 
+        self._general._agent._scenario = config.get('scenario', 'default')
+
         self._gui_weights: dict = {}
         self._step_count:  int  = 0
 
@@ -160,6 +162,8 @@ class SwarmController:
             node.register_worker(wc)
             self._workers.append(wc)
 
+        node._agent._scenario = self._config.get('scenario', 'default')
+        node._agent._llm_node._zone_hash = zone_hash
         self._nodes[zone_hash] = node
         return node
 
