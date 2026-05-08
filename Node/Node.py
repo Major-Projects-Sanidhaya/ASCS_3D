@@ -120,6 +120,7 @@ class Node:
         self._frames_scouting:  int   = 0     # frames spent in SCOUTING phase
         self._min_scout_frames: int   = 60    # wait at least 1 s before TASKING
         self._last_known_coverage: float = 0.0
+        self._prev_coverage:       float = 0.0
 
         self._scout_waypoints: dict = {}  # scout id → current target np.ndarray
         self._scout_arrived:   dict = {}  # scout id → bool
@@ -399,6 +400,78 @@ class Node:
         self._delta_sep   = float(np.clip(delta_sep,   -0.25, 0.25))
         self._delta_align = float(np.clip(delta_align, -0.25, 0.25))
         self._delta_coh   = float(np.clip(delta_coh,   -0.25, 0.25))
+
+    def compute_reward(self, prev_pos: np.ndarray, phase: int = 1) -> float:
+        """
+        Zero-centred reward in [-1, +1].
+        Measures what the policy *changed*, not absolute state,
+        so warm-up coverage doesn't inflate the signal.
+        """
+        reward = 0.0
+
+        # ── Phase 1: Formation spread via UWB relative positions ──────────────
+        # obs_min from read_tof_obstacle() is a placeholder (always 5.0).
+        # Real pairwise distances come from rel_positions in scout packets.
+        if self._last_packets:
+            rel_dists = []
+            for pkt in self._last_packets:
+                for rp in pkt.get('rel_positions', []):
+                    try:
+                        d = float(np.linalg.norm(rp))
+                        if d > 0.01:
+                            rel_dists.append(d)
+                    except Exception:
+                        pass
+            if rel_dists:
+                min_dist = min(rel_dists)
+                if min_dist < 2.0:
+                    reward -= (2.0 - min_dist) / 2.0   # crowding: 0 to -1
+                elif min_dist > 7.0:
+                    reward -= min(1.0, (min_dist - 7.0) / 5.0)   # isolation penalty
+                else:
+                    reward += 0.15   # good spread bonus
+            else:
+                reward -= 0.05   # scouts present but no UWB neighbors visible
+        else:
+            reward -= 0.1   # no packets at all
+
+        if phase < 2:
+            return float(np.clip(reward, -1.0, 1.0))
+
+        # ── Phase 2: Waypoint progress ────────────────────────────────────────
+        dist_before = float(np.linalg.norm(prev_pos - self._waypoint))
+        dist_after  = float(np.linalg.norm(self.pos  - self._waypoint))
+        progress    = dist_before - dist_after          # positive = closer
+        reward += float(np.clip(progress / 0.2, -1.0, 1.0)) * 0.5
+
+        if phase < 3:
+            return float(np.clip(reward, -1.0, 1.0))
+
+        # ── Phase 3: Coverage delta ───────────────────────────────────────────
+        # Reward change in coverage, not its absolute value — doing nothing → 0.
+        cov_now   = self._coverage_fraction
+        cov_delta = cov_now - self._prev_coverage
+        self._prev_coverage = cov_now
+
+        if cov_delta > 0:
+            reward += cov_delta * 2.0
+        elif cov_delta < 0:
+            reward += cov_delta * 1.0
+
+        if phase < 4:
+            return float(np.clip(reward, -1.0, 1.0))
+
+        # ── Phase 4: Formation quality ────────────────────────────────────────
+        spread = self.compute_cluster_spread()
+        target_spreads = {
+            'SCOUT': 4.0, 'CONVERGE': 1.5,
+            'HOLD': 2.5, 'DISPERSE': 5.0, 'WITHDRAW': 3.0,
+        }
+        target     = target_spreads.get(self._mode, 2.5)
+        spread_err = abs(spread - target) / (target + 1e-6)
+        reward += float(np.clip(1.0 - spread_err, -1.0, 1.0)) * 0.3
+
+        return float(np.clip(reward, -1.0, 1.0))
 
     # ── Waypoint Decomposition ──
 

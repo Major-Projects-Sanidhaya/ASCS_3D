@@ -16,13 +16,13 @@ class PyFlytPhysics(DronePhysics):
     MAX_SPEED    = 5.0
     HOVER_THRUST = 0.65  # normalised thrust to hover (tune per drone)
 
-    def __init__(self, mass: float = 0.03, arm_length: float = 0.03) -> None:
+    def __init__(self, mass: float = 0.03, arm_length: float = 0.03,
+                 drone_model: str = 'cf2x') -> None:
         """
-        mass:       kg  (Crazyflie ~0.027 kg, larger drones 0.3–1.5 kg)
-        arm_length: m   (Crazyflie ~0.03 m)
+        mass/arm_length kept for API compatibility; PyFlyt 0.29+ uses
+        drone_model ('cf2x' = Crazyflie X, the default mini-quad).
         """
-        self._mass        = mass
-        self._arm_length  = arm_length
+        self._drone_model = drone_model
         self._aviary      = None
         self._pos         = np.zeros(3)
         self._vel         = np.zeros(3)
@@ -36,14 +36,11 @@ class PyFlytPhysics(DronePhysics):
             start_orn = np.zeros((1, 3))
 
             self._aviary = Aviary(
-                start_pos    = start_pos,
-                start_orn    = start_orn,
-                drone_type   = 'quadx',
-                render       = False,
-                drone_options = {
-                    'mass':       self._mass,
-                    'arm_length': self._arm_length,
-                },
+                start_pos     = start_pos,
+                start_orn     = start_orn,
+                drone_type    = 'quadx',
+                render        = False,
+                drone_options = {'drone_model': self._drone_model},
             )
             self._env_id      = 0
             self._initialized = True
@@ -96,10 +93,10 @@ class PyFlytPhysics(DronePhysics):
 
     def get_state(self) -> dict:
         return {
-            'pos':         self._pos.tolist(),
-            'vel':         self._vel.tolist(),
-            'initialized': self._initialized,
-            'mass':        self._mass,
+            'pos':          self._pos.tolist(),
+            'vel':          self._vel.tolist(),
+            'initialized':  self._initialized,
+            'drone_model':  self._drone_model,
         }
 
     def __del__(self):
