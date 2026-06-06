@@ -1,7 +1,10 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python verify/logic_tests.py)"
+      "Bash(python verify/logic_tests.py)",
+      "Bash(mkdir:*)",
+      "Bash(python -m pytest tests/test_scout_personality.py -v)",
+      "Bash(python:*)"
     ]
   }
 }

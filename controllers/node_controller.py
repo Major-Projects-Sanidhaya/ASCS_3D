@@ -40,37 +40,86 @@ class NodeController(BaseController):
         self._worker_controllers: List = []
         self._gui_weights: Optional[dict] = None
 
+        # Optional step trace for testing tick order verification
+        self._step_trace: Optional[List[str]] = None
+
     # ── Abstract Method Implementations ──
 
     def step(self, dt: float) -> None:
         """
         Advance the Node agent by one simulation tick.
 
-        Order:
-          1.  Tick uptime.
-          2.  Clear stale packet buffer.
-          3.  Each Scout emits a packet into the Node's buffer.
-          4.  Each Worker emits a packet into the Node's buffer.
-          5.  Aggregate observations to update cluster embedding.
-          6.  update_op_phase() — transition SCOUTING/TASKING/HOLDING.
-          7.  Compute velocity (or apply obstacle reflex if triggered).
-          8.  Broadcast VelocityCommands to Scouts.
-          9.  Broadcast TaskCommands to Workers (phase-gated).
-          10. Update Node position.
+        EXECUTION ORDER (EXPLICIT AND IMMUTABLE):
+        ==========================================
+        This order enforces proper information flow and must NOT be changed
+        without updating tests in tests/test_controller_tick_order.py.
+
+        Phase 1: UPTIME & BUFFER RESET
+          1. tick_uptime(dt): Increment controller uptime counter
+          2. clear_packet_buffer(): Discard all packets from previous tick
+          - Purpose: Fresh state for new observation cycle
+
+        Phase 2: PACKET COLLECTION (UPLINK)
+          3. For each Scout: emit_packet() → Node buffer
+          4. For each Worker: emit_packet() → Node buffer
+          - Purpose: Gather anonymous position/sensor data from subordinates
+
+        Phase 3: OBSERVATION PROCESSING
+          5. aggregate_observations(): Build cluster embedding from packets
+          6. update_op_phase(): Transition SCOUTING/TASKING/HOLDING based on coverage
+          - Purpose: Derive high-level state from distributed observations
+
+        Phase 4: DECISION & COMMAND GENERATION
+          7. handle_obstacle_reflex() or compute_velocity(): Reynolds + RL offsets
+          8. broadcast_scout_commands(): Send VelocityCommands to all Scouts
+          9. broadcast_worker_commands(): Send TaskCommands (phase-gated by op_phase)
+          - Purpose: Convert aggregated state into actionable commands
+
+        Phase 5: MOTION
+          10. update_position(dt): Integrate velocity, clamp to arena bounds
+          - Purpose: Apply computed motion
+
+        CRITICAL INVARIANTS:
+        - Packet buffer MUST be cleared BEFORE scouts/workers emit
+        - aggregate_observations MUST run AFTER all emits
+        - update_op_phase MUST run AFTER aggregate (uses cluster embedding)
+        - Worker commands MUST be gated by op_phase (no deploy until TASKING)
+        - send_report (called by SwarmController) MUST run AFTER this step() completes
         """
+        # Phase 1: Uptime & buffer reset
+        if self._step_trace is not None:
+            self._step_trace.append('TICK_UPTIME')
         self.tick_uptime(dt)
+
+        if self._step_trace is not None:
+            self._step_trace.append('CLEAR_BUFFER')
         self._agent.clear_packet_buffer()
 
+        # Phase 2: Packet collection (uplink from subordinates)
         all_scout_agents = [sc._agent for sc in self._scout_controllers]
 
-        for sc in self._scout_controllers:
+        for i, sc in enumerate(self._scout_controllers):
+            if self._step_trace is not None:
+                self._step_trace.append(f'EMIT_SCOUT_{i}')
             sc._agent.emit_packet(self._agent, all_scout_agents)
-        for wc in self._worker_controllers:
+
+        for i, wc in enumerate(self._worker_controllers):
+            if self._step_trace is not None:
+                self._step_trace.append(f'EMIT_WORKER_{i}')
             wc._agent.emit_packet(self._agent)
 
+        # Phase 3: Observation processing
+        if self._step_trace is not None:
+            self._step_trace.append('AGGREGATE_OBSERVATIONS')
         self._agent.aggregate_observations()
-        self._agent.update_op_phase()          # must run after aggregation
 
+        if self._step_trace is not None:
+            self._step_trace.append('UPDATE_OP_PHASE')
+        self._agent.update_op_phase()  # MUST run after aggregation
+
+        # Phase 4: Decision & command generation
+        if self._step_trace is not None:
+            self._step_trace.append('COMPUTE_VELOCITY')
         reflex = self._agent.handle_obstacle_reflex(99.0)
         if reflex is None:
             vel = self._agent.compute_velocity()
@@ -78,10 +127,19 @@ class NodeController(BaseController):
             vel = reflex
         self._agent.vel = vel
 
+        if self._step_trace is not None:
+            self._step_trace.append('BROADCAST_SCOUT_COMMANDS')
         self._agent.broadcast_scout_commands(all_scout_agents)
+
+        if self._step_trace is not None:
+            self._step_trace.append('BROADCAST_WORKER_COMMANDS')
         self._agent.broadcast_worker_commands(
             [wc._agent for wc in self._worker_controllers]
         )
+
+        # Phase 5: Motion
+        if self._step_trace is not None:
+            self._step_trace.append('UPDATE_POSITION')
         self._agent.update_position(dt)
 
     def receive_downlink(self, packet: dict) -> None:

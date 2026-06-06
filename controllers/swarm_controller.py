@@ -85,6 +85,9 @@ class SwarmController:
         self._gui_weights: dict = {}
         self._step_count:  int  = 0
 
+        # Optional step trace for testing tick order verification
+        self._step_trace: Optional[List[str]] = None
+
     @staticmethod
     def _clear_generated_behaviors() -> None:
         """Delete all previously generated behavior files at startup."""
@@ -107,25 +110,69 @@ class SwarmController:
         """
         Tick every tier in top-down order for one simulation step.
 
-        Order:
-          1. General (FSM, zone checks, token broadcast).
-          2. Nodes   (packet collection, aggregation, Reynolds, commands, position).
-             node.send_report() called here — after Node tick, before next General tick.
-          3. Scouts  (position update, battery, silence detection).
-          4. Workers (FSM, position update, battery).
-        """
-        self._general.step(dt)
+        EXECUTION ORDER (EXPLICIT AND IMMUTABLE):
+        ==========================================
+        This order enforces proper causality chains and must NOT be changed
+        without updating all dependent tests in tests/test_controller_tick_order.py.
 
-        for node in self._nodes.values():
+        Phase 1: GENERAL TIER
+          - General.step(dt): FSM transitions, zone health checks, token broadcast
+          - Purpose: Top-level mission planning, zone allocation
+
+        Phase 2: NODE TIER (for each node)
+          - node.set_gui_weights(): Apply GUI/RL overrides
+          - node.step(dt): See NodeController.step() for internal order
+          - node.send_report(): Uplink cluster state to General
+          - Purpose: Mid-tier coordination, packet aggregation, command dispatch
+
+        Phase 3: SCOUT TIER (for each scout)
+          - scout.step(dt): Position update, battery check, silence detection
+          - Purpose: Environmental sensing, formation maintenance
+
+        Phase 4: WORKER TIER (for each worker)
+          - worker.step(dt): Task FSM, position update, battery check
+          - Purpose: Task execution, payload actuation
+
+        CRITICAL INVARIANTS:
+        - General MUST complete before any Node starts
+        - All Nodes MUST complete before any Scout starts
+        - All Scouts MUST complete before any Worker starts
+        - Nodes send reports AFTER their own step(), BEFORE next General tick
+        """
+        # Phase 1: General tier
+        if self._step_trace is not None:
+            self._step_trace.append('GENERAL_START')
+        self._general.step(dt)
+        if self._step_trace is not None:
+            self._step_trace.append('GENERAL_END')
+
+        # Phase 2: Node tier (includes report sending)
+        for zone_hash, node in self._nodes.items():
+            if self._step_trace is not None:
+                self._step_trace.append(f'NODE_{zone_hash}_START')
+
             node.set_gui_weights(self._gui_weights)
             node.step(dt)
             node._agent.send_report(self._general._agent)
 
-        for scout in self._scouts:
-            scout.step(dt)
+            if self._step_trace is not None:
+                self._step_trace.append(f'NODE_{zone_hash}_END')
 
-        for worker in self._workers:
+        # Phase 3: Scout tier
+        for i, scout in enumerate(self._scouts):
+            if self._step_trace is not None:
+                self._step_trace.append(f'SCOUT_{i}_START')
+            scout.step(dt)
+            if self._step_trace is not None:
+                self._step_trace.append(f'SCOUT_{i}_END')
+
+        # Phase 4: Worker tier
+        for i, worker in enumerate(self._workers):
+            if self._step_trace is not None:
+                self._step_trace.append(f'WORKER_{i}_START')
             worker.step(dt)
+            if self._step_trace is not None:
+                self._step_trace.append(f'WORKER_{i}_END')
 
         self._step_count += 1
 

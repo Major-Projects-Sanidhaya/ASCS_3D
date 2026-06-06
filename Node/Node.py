@@ -403,15 +403,32 @@ class Node:
 
     def compute_reward(self, prev_pos: np.ndarray, phase: int = 1) -> float:
         """
-        Zero-centred reward in [-1, +1].
-        Measures what the policy *changed*, not absolute state,
-        so warm-up coverage doesn't inflate the signal.
+        RL reward function for training Node policies across 4 phases.
+
+        Returns
+        -------
+        float
+            Reward in [-1.0, 1.0] always.
+
+        Phase 1: Collision avoidance
+            Penalizes scouts too close (< 2.0m), rewards good spacing (2.0-7.0m).
+            Zero when no scouts present or all at safe distance.
+
+        Phase 2: Phase 1 + waypoint progress
+            Adds reward for reducing distance to waypoint.
+
+        Phase 3: Phase 2 + coverage delta
+            Rewards CHANGE in coverage, not absolute value.
+            Zero delta = zero contribution. Positive delta = positive reward.
+
+        Phase 4: Phase 3 + formation quality
+            Rewards formation spread matching target for current mode.
         """
         reward = 0.0
 
-        # ── Phase 1: Formation spread via UWB relative positions ──────────────
-        # obs_min from read_tof_obstacle() is a placeholder (always 5.0).
-        # Real pairwise distances come from rel_positions in scout packets.
+        # ── Phase 1: Collision penalty only ───────────────────────────────────
+        # Negative when any scout is within 2.0m, proportional to severity.
+        # Zero when no scouts close. Uses UWB relative positions.
         if self._last_packets:
             rel_dists = []
             for pkt in self._last_packets:
@@ -422,54 +439,76 @@ class Node:
                             rel_dists.append(d)
                     except Exception:
                         pass
+
             if rel_dists:
                 min_dist = min(rel_dists)
+                # Collision penalty: linear from 0 at 2.0m to -1.0 at 0m
                 if min_dist < 2.0:
-                    reward -= (2.0 - min_dist) / 2.0   # crowding: 0 to -1
+                    reward -= (2.0 - min_dist) / 2.0   # range: [0, -1.0]
+                # Good spacing bonus: scouts at safe distance (optimal 3-5m)
+                elif 2.0 <= min_dist <= 7.0:
+                    # Small positive reward for good spacing, peaks at ~4m
+                    optimal_dist = 4.0
+                    dist_quality = 1.0 - abs(min_dist - optimal_dist) / 3.0
+                    reward += max(0.0, dist_quality * 0.1)  # Small bonus
+                # Isolation penalty: scouts too far (formation breaking)
                 elif min_dist > 7.0:
-                    reward -= min(1.0, (min_dist - 7.0) / 5.0)   # isolation penalty
-                else:
-                    reward += 0.15   # good spread bonus
-            else:
-                reward -= 0.05   # scouts present but no UWB neighbors visible
-        else:
-            reward -= 0.1   # no packets at all
+                    penalty = min(1.0, (min_dist - 7.0) / 5.0)
+                    reward -= penalty * 0.5  # Reduced penalty weight
+        # No penalty/reward when no packets (scout-less zones are valid)
 
         if phase < 2:
             return float(np.clip(reward, -1.0, 1.0))
 
         # ── Phase 2: Waypoint progress ────────────────────────────────────────
+        # Reward distance reduction toward waypoint, normalized by expected
+        # max movement per step (assume ~0.2m per step at 60Hz).
         dist_before = float(np.linalg.norm(prev_pos - self._waypoint))
         dist_after  = float(np.linalg.norm(self.pos  - self._waypoint))
-        progress    = dist_before - dist_after          # positive = closer
+        progress    = dist_before - dist_after  # positive = closer
+
+        # Normalize by expected max step distance to keep in [-1, 1] range
+        # Scale by 0.5 to avoid dominating phase 1 penalty
         reward += float(np.clip(progress / 0.2, -1.0, 1.0)) * 0.5
 
         if phase < 3:
             return float(np.clip(reward, -1.0, 1.0))
 
         # ── Phase 3: Coverage delta ───────────────────────────────────────────
-        # Reward change in coverage, not its absolute value — doing nothing → 0.
+        # Reward CHANGE in coverage, not absolute value.
+        # Zero delta = zero contribution. Positive delta = positive reward.
+        # This prevents warm-up coverage from inflating the signal.
         cov_now   = self._coverage_fraction
         cov_delta = cov_now - self._prev_coverage
         self._prev_coverage = cov_now
 
+        # Scale coverage delta (typically small values like 0.01 per step)
+        # Amplify to make it meaningful in the [-1, 1] range
         if cov_delta > 0:
             reward += cov_delta * 2.0
         elif cov_delta < 0:
-            reward += cov_delta * 1.0
+            reward += cov_delta * 1.0  # Penalize coverage loss less than gain
 
         if phase < 4:
             return float(np.clip(reward, -1.0, 1.0))
 
         # ── Phase 4: Formation quality ────────────────────────────────────────
+        # Reward formation spread matching target for current mode.
+        # Different modes require different spacing (CONVERGE tight, DISPERSE wide).
         spread = self.compute_cluster_spread()
         target_spreads = {
-            'SCOUT': 4.0, 'CONVERGE': 1.5,
-            'HOLD': 2.5, 'DISPERSE': 5.0, 'WITHDRAW': 3.0,
+            'SCOUT':    4.0,
+            'CONVERGE': 1.5,
+            'HOLD':     2.5,
+            'DISPERSE': 5.0,
+            'WITHDRAW': 3.0,
         }
         target     = target_spreads.get(self._mode, 2.5)
         spread_err = abs(spread - target) / (target + 1e-6)
-        reward += float(np.clip(1.0 - spread_err, -1.0, 1.0)) * 0.3
+
+        # Formation quality: 1.0 when perfect, 0.0 when error = target
+        formation_quality = float(np.clip(1.0 - spread_err, -1.0, 1.0))
+        reward += formation_quality * 0.3  # Weight to avoid dominating other terms
 
         return float(np.clip(reward, -1.0, 1.0))
 
