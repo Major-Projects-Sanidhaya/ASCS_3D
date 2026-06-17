@@ -90,8 +90,8 @@ class DefaultScoutBehavior(ScoutBehavior):
                          obs_min, arena_hw, arena_hh) -> np.ndarray:
         v = np.zeros(3)
 
-        # Wall repulsion
-        repulse = 2.0
+        # Wall repulsion - balanced at 0.5m for corner coverage without getting stuck
+        repulse = 0.5
         for axis, half in [(0, arena_hw), (1, arena_hh)]:
             d_hi = half - pos[axis]
             d_lo = pos[axis] + half
@@ -100,17 +100,43 @@ class DefaultScoutBehavior(ScoutBehavior):
             if d_lo < repulse:
                 v[axis] += (repulse - d_lo) * 4.0
 
-        # Separation
+        # Separation - ALWAYS ACTIVE, grows sharply as scouts get close
+        # Track closest neighbor for waypoint scaling
+        closest_neighbor_dist = 999.0
+
         for rp in neighbor_pos:
             dist = float(np.linalg.norm(rp))
             if 0.01 < dist < self.SEP_RADIUS:
-                v -= (rp / dist) / (dist + 1e-6) * self.W_SEP
+                closest_neighbor_dist = min(closest_neighbor_dist, dist)
 
-        # Waypoint pull
+                # Base separation with inverse-square scaling
+                sep_force = (rp / dist) / (dist ** 2 + 1e-6) * self.W_SEP * 3.0
+                v -= sep_force
+
+        # Waypoint pull - CONTINUOUSLY SCALED based on closest neighbor
+        # Close neighbors → weak waypoint pull (separation wins)
+        # Far neighbors → strong waypoint pull (reach corners)
         wp_vec  = self.patrol_target - pos
         wp_dist = float(np.linalg.norm(wp_vec))
         if wp_dist > 0.05:
-            v += (wp_vec / wp_dist) * self.W_WP
+            # Scale waypoint strength based on closest neighbor distance
+            # dist < 0.8m → 0% waypoint pull
+            # dist = 1.0m → 20% waypoint pull
+            # dist = 1.5m → 70% waypoint pull
+            # dist > 2.0m → 150% waypoint pull (boosted for corners)
+            if closest_neighbor_dist < 0.8:
+                wp_scale = 0.0  # Complete priority to separation
+            elif closest_neighbor_dist < 1.5:
+                # Linear ramp from 0% at 0.8m to 70% at 1.5m
+                wp_scale = (closest_neighbor_dist - 0.8) / (1.5 - 0.8)
+            elif closest_neighbor_dist < 2.0:
+                # Ramp from 70% at 1.5m to 100% at 2.0m
+                wp_scale = 0.7 + 0.3 * (closest_neighbor_dist - 1.5) / (2.0 - 1.5)
+            else:
+                # Boost for corner coverage when no close neighbors
+                wp_scale = 1.5
+
+            v += (wp_vec / wp_dist) * (self.W_WP * wp_scale)
 
         # Altitude hold
         v[2] = (self.patrol_target[2] - pos[2]) * 2.0

@@ -39,6 +39,7 @@ class TestSwarmTickOrder:
         }
         return SwarmController(config)
 
+    @pytest.mark.slow
     def test_general_steps_before_nodes(self, swarm):
         """General.step() must be called before any Node.step() in swarm.step()."""
         call_order = []
@@ -73,6 +74,7 @@ class TestSwarmTickOrder:
                 assert node_idx > general_idx, \
                     f"Node {item} stepped before General"
 
+    @pytest.mark.slow
     def test_nodes_step_before_scouts(self, swarm):
         """All Node.step() must complete before any Scout.step()."""
         call_order = []
@@ -106,6 +108,7 @@ class TestSwarmTickOrder:
             assert last_node_idx < first_scout_idx, \
                 f"All nodes must complete before scouts start. Order: {call_order}"
 
+    @pytest.mark.slow
     def test_scouts_step_before_workers(self, swarm):
         """All Scout.step() must complete before any Worker.step()."""
         call_order = []
@@ -169,6 +172,7 @@ class TestNodeTickOrder:
 
         return nc
 
+    @pytest.mark.slow
     def test_packets_cleared_before_emit(self, node):
         """Packet buffer must be empty BEFORE scouts emit, non-empty AFTER."""
         buffer_states = []
@@ -209,6 +213,7 @@ class TestNodeTickOrder:
         assert count_after_emit > 0, \
             f"Buffer should be non-empty after emit, got {count_after_emit}"
 
+    @pytest.mark.slow
     def test_aggregate_after_emit(self, node):
         """aggregate_observations must be called AFTER all scouts emit."""
         call_order = []
@@ -240,6 +245,7 @@ class TestNodeTickOrder:
                 assert i < aggregate_idx, \
                     f"Aggregate must come after all emits. Order: {call_order}"
 
+    @pytest.mark.slow
     def test_op_phase_update_after_aggregate(self, node):
         """update_op_phase must be called AFTER aggregate_observations."""
         call_order = []
@@ -271,6 +277,7 @@ class TestNodeTickOrder:
         assert aggregate_idx < op_phase_idx, \
             f"update_op_phase must come after aggregate. Order: {call_order}"
 
+    @pytest.mark.slow
     def test_report_sent_after_op_phase(self):
         """send_report to General must be called after update_op_phase completes."""
         # This test runs at the swarm level since send_report is called there
@@ -314,6 +321,7 @@ class TestNodeTickOrder:
         assert op_phase_idx < report_idx, \
             f"send_report must come after update_op_phase. Order: {call_order}"
 
+    @pytest.mark.slow
     def test_worker_commands_gated_by_op_phase(self, node):
         """Workers receive HOVER in SCOUTING phase, MOVE_TO in TASKING phase."""
         # Test SCOUTING phase
@@ -364,6 +372,7 @@ class TestNodeTickOrder:
 class TestStepTracing:
     """Test suite demonstrating new _step_trace functionality."""
 
+    @pytest.mark.slow
     def test_swarm_step_trace(self):
         """Demonstrate SwarmController._step_trace captures full execution order."""
         config = {
@@ -412,6 +421,7 @@ class TestStepTracing:
         print(f"\nStep trace captured {len(swarm._step_trace)} events:")
         print(swarm._step_trace[:20])  # Print first 20 events
 
+    @pytest.mark.slow
     def test_node_step_trace(self):
         """Demonstrate NodeController._step_trace captures internal execution order."""
         zone_map = ZoneMap(arena_w=20.0, arena_h=20.0, grid_cols=1, grid_rows=1)

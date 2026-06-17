@@ -225,20 +225,28 @@ class Worker:
     def update_position(self, dt: float) -> None:
         """
         Movement gated on authorized flag.
-        If not authorized: pin to spawn, zero velocity.
+        If not authorized: completely stationary, no position updates.
         If authorized: navigate toward task target.
         """
-        # Gate 1: no command at all → hold completely still
+        # Gate 1: Check authorization FIRST before any processing
+        if self._current_cmd is not None:
+            authorized = self._current_cmd.get('authorized', False)
+            if not authorized:
+                # NOT AUTHORIZED: Worker is completely frozen at current position
+                # Zero velocity and do not update position at all
+                self.vel = np.array([0.0, 0.0, 0.0])
+                return
+
+        # Gate 2: no command at all → hold completely still
         if self._current_cmd is None:
             self.vel *= 0.5
             self.pos += self.vel * dt
             return
 
         action     = self._current_cmd.get('action', 'MOVE_TO')
-        authorized = self._current_cmd.get('authorized', False)
 
-        # Gate 2: HOVER or not authorized → pin to target position
-        if action == 'HOVER' or not authorized:
+        # Gate 3: HOVER (authorized) → hold at target position
+        if action == 'HOVER':
             target = np.array(self._current_cmd['target_pos'])
             hold   = (target - self.pos) * 1.5
             hold[2] = self.altitude_hold(target[2])
@@ -252,7 +260,7 @@ class Worker:
             self.pos[2] = float(np.clip(self.pos[2],  0.3, 9.0))
             return
 
-        # Gate 3: authorized MOVE_TO — navigate to target
+        # Gate 4: authorized MOVE_TO — navigate to target
         if self._task_state in ('IDLE', 'COMPLETE', 'FAILED'):
             self.vel *= 0.7
             self.pos += self.vel * dt

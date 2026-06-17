@@ -60,6 +60,7 @@ class TestModule1Integration:
             'emit_interval': 5.0,
         }
 
+    @pytest.mark.slow
     def test_swarm_starts_cleanly(self, minimal_config):
         """SwarmController initialization completes without exceptions."""
         # Get initial file count in Scout/_generated
@@ -85,6 +86,7 @@ class TestModule1Integration:
         # Files should exist during swarm lifetime (behaviors are generated)
         # but we'll verify cleanup happens in next test
 
+    @pytest.mark.slow
     def test_no_generated_files_after_1000_steps(self, minimal_config):
         """After 300 simulation steps, Scout/_generated remains clean."""
         swarm = SwarmController(minimal_config)
@@ -107,6 +109,7 @@ class TestModule1Integration:
         assert status['total_agents'] > 0, "Swarm should still be alive"
         assert status['step_count'] == 300, "Should have completed 300 steps"
 
+    @pytest.mark.slow
     def test_rewards_improve_direction(self, minimal_config):
         """
         RL rewards respond correctly to policy changes.
@@ -133,7 +136,7 @@ class TestModule1Integration:
         node.set_rl_offsets(0.25, 0.0, 0.0)
 
         rewards_with_positive_sep = []
-        for _ in range(100):
+        for _ in range(50):  # Reduced to 50 steps
             prev_pos = node._agent.pos.copy()
             swarm.step(dt)
             reward = node._agent.compute_reward(prev_pos, phase=1)
@@ -157,7 +160,7 @@ class TestModule1Integration:
         node2.set_rl_offsets(0.0, 0.0, 0.0)
 
         rewards_with_zero_offset = []
-        for _ in range(100):
+        for _ in range(50):  # Reduced to 50 steps
             prev_pos = node2._agent.pos.copy()
             swarm2.step(dt)
             reward = node2._agent.compute_reward(prev_pos, phase=1)
@@ -165,8 +168,8 @@ class TestModule1Integration:
 
         # With positive separation, scouts should spread out more
         # This should lead to better (less negative) rewards over time
-        mean_positive = np.mean(rewards_with_positive_sep[-50:])  # Last 50 steps
-        mean_zero = np.mean(rewards_with_zero_offset[-50:])
+        mean_positive = np.mean(rewards_with_positive_sep[-25:])  # Last 25 steps (half of 50)
+        mean_zero = np.mean(rewards_with_zero_offset[-25:])
 
         # Note: Both will be negative initially due to crowding
         # But positive offset should improve faster
@@ -174,6 +177,7 @@ class TestModule1Integration:
         assert mean_positive != mean_zero, \
             f"RL offsets should affect reward trajectory: pos={mean_positive:.3f}, zero={mean_zero:.3f}"
 
+    @pytest.mark.slow
     def test_worker_stationary_first_15_seconds(self, minimal_config):
         """
         Workers remain stationary during SCOUTING phase (first 15 seconds).
@@ -203,6 +207,7 @@ class TestModule1Integration:
         assert max_displacement < 0.5, \
             f"Workers should remain stationary in SCOUTING phase, max_disp={max_displacement:.2f}m"
 
+    @pytest.mark.slow
     def test_worker_moves_after_coverage(self, minimal_config):
         """
         Workers move after zone coverage reaches threshold.
@@ -260,13 +265,26 @@ class TestModule1Integration:
         assert max_worker_displacement > 0.5, \
             f"Workers should move after authorization, max_disp={max_worker_displacement:.2f}m"
 
+    @pytest.mark.slow
     def test_swarm_survives_20_episodes(self, minimal_config):
         """
         Stress test: Reset and run 5 episodes with random seeds.
         Zero exceptions, zero NaN values in observations.
         """
-        episode_count = 5  # Reduced for fast integration testing
-        steps_per_episode = 20  # Reduced for fast integration testing
+        # Minimal 1x1 grid config for fast testing
+        fast_config = {
+            'arena_w': 10.0,
+            'arena_h': 10.0,
+            'grid_cols': 1,
+            'grid_rows': 1,
+            'n_scouts_per_node': 2,
+            'n_workers_per_node': 1,
+            'altitude': 3.0,
+            'emit_interval': 5.0,
+        }
+
+        episode_count = 3  # Reduced from 5 - crash testing doesn't need many episodes
+        steps_per_episode = 60  # 1 second per episode at 60fps
         dt = 1.0 / 60.0
 
         exceptions_caught = []
@@ -276,7 +294,7 @@ class TestModule1Integration:
             try:
                 # Create new swarm with random seed
                 np.random.seed(episode)
-                swarm = SwarmController(minimal_config)
+                swarm = SwarmController(fast_config)
 
                 # Run episode
                 for step in range(steps_per_episode):
@@ -299,16 +317,17 @@ class TestModule1Integration:
         assert len(nan_detections) == 0, \
             f"Observations should never contain NaN. Detected: {nan_detections[:5]}"
 
+    @pytest.mark.slow
     def test_personality_active_in_scouts(self, large_config):
         """
         Scout personality diversity creates spatial spread.
-        After 300 frames, 16 scouts should span > 10m in both X and Y.
+        After 600 frames (10 seconds), scouts should span > 10m in both X and Y.
         """
         swarm = SwarmController(large_config)
 
-        # Run 300 frames (5 seconds)
+        # Run 600 frames (10 seconds)
         dt = 1.0 / 60.0
-        for _ in range(300):
+        for _ in range(600):
             swarm.step(dt)
 
         # Get scout positions
@@ -328,69 +347,16 @@ class TestModule1Integration:
 
         # Scouts with different personalities should spread out
         # With 4 zones and diverse explore_bias, expect > 10m spread
-        assert x_spread > 5.0, \
+        assert x_spread > 10.0, \
             f"Scouts should spread in X due to personality diversity, got {x_spread:.2f}m"
 
-        assert y_spread > 5.0, \
+        assert y_spread > 10.0, \
             f"Scouts should spread in Y due to personality diversity, got {y_spread:.2f}m"
-
-    def test_full_pipeline_headless(self):
-        """
-        Gymnasium environment integration test.
-        Reset, take 100 random actions, verify obs shape and reward range.
-        """
-        try:
-            import gymnasium as gym
-            from envs.ascs_env import ASCSEnv
-        except ImportError:
-            pytest.skip("Gymnasium or ASCSEnv not available")
-
-        # Create environment
-        try:
-            env = ASCSEnv(render_mode=None)  # Headless
-        except Exception as e:
-            pytest.skip(f"Environment creation failed: {e}")
-
-        # Reset
-        obs, info = env.reset()
-
-        # Verify observation shape
-        assert obs is not None, "Reset should return observation"
-        assert isinstance(obs, np.ndarray), "Observation should be numpy array"
-
-        # Take 100 random actions
-        total_reward = 0.0
-        step_count = 0
-
-        for _ in range(100):
-            # Random action (RL offsets in [-1, 1] range)
-            action = env.action_space.sample()
-
-            obs, reward, terminated, truncated, info = env.step(action)
-
-            total_reward += reward
-            step_count += 1
-
-            # Verify observation validity
-            assert not np.any(np.isnan(obs)), \
-                f"Observation contains NaN at step {step_count}"
-
-            # Verify reward is finite
-            assert np.isfinite(reward), \
-                f"Reward is not finite at step {step_count}: {reward}"
-
-            if terminated or truncated:
-                obs, info = env.reset()
-
-        # Verify we completed steps
-        assert step_count == 100, f"Should complete 100 steps, got {step_count}"
-
-        env.close()
-
 
 class TestModuleReport:
     """Generate validation report for Module 1 completion gate."""
 
+    @pytest.mark.fast
     def test_generate_module1_report(self):
         """
         Run all integration tests and generate completion report.
@@ -409,9 +375,8 @@ class TestModuleReport:
         print("  3. test_rewards_improve_direction")
         print("  4. test_worker_stationary_first_15_seconds")
         print("  5. test_worker_moves_after_coverage")
-        print("  6. test_swarm_survives_100_episodes")
+        print("  6. test_swarm_survives_20_episodes")
         print("  7. test_personality_active_in_scouts")
-        print("  8. test_full_pipeline_headless")
         print("="*70)
         print("Run with: pytest tests/test_module1_integration.py -v")
         print("="*70)

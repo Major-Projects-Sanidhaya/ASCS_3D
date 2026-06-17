@@ -32,10 +32,20 @@ class GeneralController(BaseController):
         position: np.ndarray,
         zone_map: ZoneMap,
         emit_interval: float = 5.0,
+        task_module=None,
     ) -> None:
         super().__init__('GENERAL', 'general_0')
         self._agent = General(position, zone_map, emit_interval)
         self._node_controllers: List = []
+
+        # Task module for threat assessment and propagation
+        if task_module is None:
+            from tasks.default_task import DefaultTask
+            task_module = DefaultTask()
+        self._task_module = task_module
+
+        # World model: zone_hash → ZoneThreatAssessment
+        self._world_model: Dict[int, Any] = {}
 
     # ── Abstract Method Implementations ──
 
@@ -44,7 +54,7 @@ class GeneralController(BaseController):
         Advance the General agent by one simulation tick.
 
         Runs in order: uptime, silence timers, FSM, zone topology checks,
-        then broadcasts GoalTokens to all registered Node agents.
+        threat propagation, then broadcasts GoalTokens to all registered Node agents.
         """
         self.tick_uptime(dt)
         self._agent.update_position(dt)
@@ -52,6 +62,11 @@ class GeneralController(BaseController):
         self._agent.run_fsm_step(dt)
         self._agent.check_zone_splits()
         self._agent.check_zone_merges()
+
+        # Propagate threats in world model
+        if self._world_model and self._task_module:
+            self._task_module.propagate_threats(self._world_model, dt)
+
         self._agent.broadcast_tokens(
             [n._agent for n in self._node_controllers]
         )

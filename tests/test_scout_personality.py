@@ -17,6 +17,7 @@ from Scout.scout_personality import get_personality, ScoutPersonality
 class TestScoutPersonality:
     """Test suite for deterministic, file-free Scout personality generation."""
 
+    @pytest.mark.fast
     def test_personality_is_deterministic(self):
         """Same scout_id always produces same personality."""
         scout_id = "scout_abc123"
@@ -32,6 +33,7 @@ class TestScoutPersonality:
         assert p1.sep_radius == p2.sep_radius
         assert np.array_equal(p1.explore_bias, p2.explore_bias)
 
+    @pytest.mark.fast
     def test_personality_differs_per_scout(self):
         """scout_0 and scout_1 in same zone have different explore_bias."""
         p0 = get_personality("scout_0")
@@ -40,6 +42,7 @@ class TestScoutPersonality:
         # They should have different explore_bias vectors
         assert not np.array_equal(p0.explore_bias, p1.explore_bias)
 
+    @pytest.mark.fast
     def test_explore_bias_fans_out(self):
         """4 scouts in same zone have explore_bias angles spread > 90 degrees apart."""
         personalities = [get_personality(f"scout_{i}") for i in range(4)]
@@ -76,6 +79,7 @@ class TestScoutPersonality:
         max_separation_deg = math.degrees(max_separation)
         assert max_separation_deg > 90.0, f"Max angular spread only {max_separation_deg:.1f}°"
 
+    @pytest.mark.fast
     def test_all_params_in_valid_range(self):
         """w_sep in [0.5,1.5], w_wp in [1.5,3.5], max_speed in [3.0,7.0],
         sep_radius in [1.0,3.0], explore_bias magnitude in [0.3,1.0]"""
@@ -92,6 +96,7 @@ class TestScoutPersonality:
             mag = np.linalg.norm(p.explore_bias)
             assert 0.3 <= mag <= 1.0, f"explore_bias magnitude={mag} out of range"
 
+    @pytest.mark.fast
     def test_no_files_created(self):
         """Generating 16 personalities creates zero files on disk."""
         # Get initial file count in Scout directory
@@ -123,6 +128,7 @@ class TestScoutPersonality:
             test_files = [f for f in py_files if "test_" in f.name]
             assert len(test_files) == 0
 
+    @pytest.mark.fast
     def test_personality_from_scout_id(self):
         """Given scout_id string returns ScoutPersonality dataclass."""
         p = get_personality("scout_xyz789")
@@ -143,6 +149,7 @@ class TestScoutPersonality:
         assert isinstance(p.explore_bias, np.ndarray)
         assert p.explore_bias.shape == (3,)
 
+    @pytest.mark.fast
     def test_compute_velocity_uses_personality(self):
         """Two scouts with different personalities produce different velocity vectors
         at same position."""

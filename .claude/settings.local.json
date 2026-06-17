@@ -4,7 +4,12 @@
       "Bash(python verify/logic_tests.py)",
       "Bash(mkdir:*)",
       "Bash(python -m pytest tests/test_scout_personality.py -v)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(pytest:*)",
+      "Bash(pip install *)",
+      "Bash(pip show *)",
+      "Bash(pip uninstall *)",
+      "Bash(Select-String -Pattern \"PASSED|FAILED|AssertionError|test_scout\" -Context 0,1)"
     ]
   }
 }

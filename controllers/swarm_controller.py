@@ -29,7 +29,7 @@ class SwarmController:
 
     # ── Initialisation ──
 
-    def __init__(self, config: dict) -> None:
+    def __init__(self, config: dict, task_module=None) -> None:
         """
         Build the complete swarm from a flat config dict.
 
@@ -42,7 +42,19 @@ class SwarmController:
             n_workers_per_node = 1
             altitude           = 3.0
             emit_interval      = 5.0
+
+        Args:
+            config: Configuration dictionary
+            task_module: Optional TaskModule for threat assessment and action generation.
+                        If None, uses DefaultTask for backward compatibility.
         """
+        # Import here to avoid circular dependencies
+        if task_module is None:
+            from tasks.default_task import DefaultTask
+            task_module = DefaultTask()
+
+        self._task_module = task_module
+
         arena_w       = config.get('arena_w',            20.0)
         arena_h       = config.get('arena_h',            20.0)
         grid_cols     = config.get('grid_cols',          2)
@@ -61,6 +73,7 @@ class SwarmController:
             np.array([0.0, 0.0, self._altitude + 2.0]),
             self._zone_map,
             emit_interval,
+            task_module=self._task_module,
         )
 
         self._nodes:   Dict[int, NodeController] = {}
@@ -394,3 +407,125 @@ class SwarmController:
             'scouts':  [s._agent.pos.copy() for s in self._scouts],
             'workers': [w._agent.pos.copy() for w in self._workers],
         }
+
+    def get_render_state(self):
+        """
+        Return a pure data snapshot for rendering.
+
+        This is the ONLY interface between simulation and visualization.
+        NO agent references, NO numpy arrays - just JSON-serializable primitives.
+
+        Returns:
+            RenderState with drones, zones, and LLM messages
+        """
+        from rendering.render_state import RenderState, DroneRenderInfo, ZoneRenderInfo, TIER_COLORS
+
+        drones = []
+
+        # General
+        gen_agent = self._general._agent
+        gen_heading = getattr(gen_agent, 'heading', None)
+        if gen_heading is not None:
+            gen_heading_tuple = (float(gen_heading[0]), float(gen_heading[1]), float(gen_heading[2]))
+        else:
+            gen_heading_tuple = (1.0, 0.0, 0.0)  # Default heading
+
+        drones.append(DroneRenderInfo(
+            drone_id='general_0',
+            tier='GENERAL',
+            position=(float(gen_agent.pos[0]), float(gen_agent.pos[1]), float(gen_agent.pos[2])),
+            color=TIER_COLORS['GENERAL'],
+            heading=gen_heading_tuple,
+            state=gen_agent._mission_phase,
+        ))
+
+        # Nodes
+        for zone_hash, node_ctrl in self._nodes.items():
+            node_agent = node_ctrl._agent
+            node_heading = getattr(node_agent, 'heading', None)
+            if node_heading is not None:
+                node_heading_tuple = (float(node_heading[0]), float(node_heading[1]), float(node_heading[2]))
+            else:
+                node_heading_tuple = (1.0, 0.0, 0.0)  # Default heading
+
+            drones.append(DroneRenderInfo(
+                drone_id=f'node_{zone_hash}',
+                tier='NODE',
+                position=(float(node_agent.pos[0]), float(node_agent.pos[1]), float(node_agent.pos[2])),
+                color=TIER_COLORS['NODE'],
+                heading=node_heading_tuple,
+                state=node_agent._op_phase,
+            ))
+
+        # Scouts
+        for i, scout_ctrl in enumerate(self._scouts):
+            scout_agent = scout_ctrl._agent
+            drones.append(DroneRenderInfo(
+                drone_id=scout_agent.scout_id,
+                tier='SCOUT',
+                position=(float(scout_agent.pos[0]), float(scout_agent.pos[1]), float(scout_agent.pos[2])),
+                color=TIER_COLORS['SCOUT'],
+                heading=(float(scout_agent.heading[0]), float(scout_agent.heading[1]), float(scout_agent.heading[2])),
+                state='ACTIVE',
+            ))
+
+        # Workers
+        for i, worker_ctrl in enumerate(self._workers):
+            worker_agent = worker_ctrl._agent
+            drones.append(DroneRenderInfo(
+                drone_id=f'worker_{i}',
+                tier='WORKER',
+                position=(float(worker_agent.pos[0]), float(worker_agent.pos[1]), float(worker_agent.pos[2])),
+                color=TIER_COLORS['WORKER'],
+                heading=(1.0, 0.0, 0.0),  # Workers don't have heading
+                state=worker_agent._task_state,
+            ))
+
+        # Zones
+        zones = []
+        world_model = getattr(self._general._agent, '_world_model', {})
+        for zone_hash in self._zone_map.active_zones():
+            center = self._zone_map.get_zone_centre(zone_hash)
+            threat = world_model.get(zone_hash)
+
+            # Get coverage from node if it exists
+            coverage = 0.0
+            if zone_hash in self._nodes:
+                node_agent = self._nodes[zone_hash]._agent
+                coverage = float(getattr(node_agent, '_coverage_fraction', 0.0))
+
+            if threat:
+                # Handle both dict and ZoneThreatAssessment objects
+                if isinstance(threat, dict):
+                    threat_score = float(threat.get('threat_score', 0.0))
+                    fire_intensity = float(threat.get('fire_intensity', 0.0))
+                    human_present = bool(threat.get('human_present', False))
+                else:
+                    # ZoneThreatAssessment object
+                    threat_score = float(threat.threat_score)
+                    fire_intensity = float(threat.fire_intensity)
+                    human_present = bool(threat.human_present)
+
+                zones.append(ZoneRenderInfo(
+                    zone_hash=zone_hash,
+                    center=(float(center[0]), float(center[1])),
+                    threat_score=threat_score,
+                    fire_intensity=fire_intensity,
+                    human_present=human_present,
+                    coverage_fraction=coverage,
+                ))
+            else:
+                # No threat assessment yet - use defaults
+                zones.append(ZoneRenderInfo(
+                    zone_hash=zone_hash,
+                    center=(float(center[0]), float(center[1])),
+                    threat_score=0.0,
+                    fire_intensity=0.0,
+                    human_present=False,
+                    coverage_fraction=coverage,
+                ))
+
+        # LLM messages (max 5, most recent last)
+        llm_messages = self._general._agent.get_reasoning_messages()
+
+        return RenderState(drones=drones, zones=zones, llm_messages=llm_messages)

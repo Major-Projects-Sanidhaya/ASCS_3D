@@ -118,7 +118,7 @@ class Node:
         self._op_phase:         str   = OP_SCOUTING
         self._coverage_fraction: float = 0.0
         self._frames_scouting:  int   = 0     # frames spent in SCOUTING phase
-        self._min_scout_frames: int   = 60    # wait at least 1 s before TASKING
+        self._min_scout_frames: int   = int(MIN_SCOUTING_SECONDS * 60)  # 15s at 60fps
         self._last_known_coverage: float = 0.0
         self._prev_coverage:       float = 0.0
 
@@ -584,8 +584,10 @@ class Node:
 
             general_authorized = False
             try:
-                general_authorized = self._zone_map._general_ref.is_worker_authorized(
-                    self.zone_hash)
+                general_authorized = (
+                    self._zone_map._general_ref.is_worker_authorized(self.zone_hash)
+                    and self._frames_scouting >= self._min_scout_frames
+                )
             except Exception:
                 general_authorized = (
                     self._coverage_fraction >= COVERAGE_THRESHOLD
@@ -629,47 +631,86 @@ class Node:
     def assign_scout_patrol_targets(self, scouts: List) -> None:
         """
         Assigns each Scout a unique patrol target within this zone.
-        Uses a grid subdivision: divides the zone into NxN cells,
-        assigns one cell centre per Scout, cycling through cells.
-        Only reassigns a Scout when it has arrived at its current target.
+
+        IMPROVED COVERAGE STRATEGY:
+        - Generates patrol points in concentric rings covering the FULL zone
+        - Rings at 0.3R, 0.65R, 0.9R where R is zone radius
+        - Each scout gets a different patrol point, cycling through all points
+        - This ensures scouts explore the entire zone, not just the center
+
+        Target: scouts cover > 20m² per scout, > 75% overall coverage.
         """
         if not scouts:
             return
 
         try:
             mn, mx = self._zone_map.get_zone_bounds(self.zone_hash)
+            zone_center = self._zone_map.get_zone_centre(self.zone_hash)
             zw = mx[0] - mn[0]
             zh = mx[1] - mn[1]
+            zone_radius = min(zw, zh) / 2.0  # Conservative zone radius
         except Exception:
             return
 
-        cell_size = 2.5
-        n_cols = max(2, int(zw / cell_size))
-        n_rows = max(2, int(zh / cell_size))
+        # Generate patrol points for SQUARE zone coverage (not circular rings!)
+        # Square zones need corner coverage that rings cannot provide
         patrol_cells = []
-        for row in range(n_rows):
-            for col in range(n_cols):
-                cx = mn[0] + (col + 0.5) * (zw / n_cols)
-                cy = mn[1] + (row + 0.5) * (zh / n_rows)
-                patrol_cells.append(np.array([cx, cy, 3.0]))
+
+        # Get zone bounds for accurate width/height
+        try:
+            mn, mx = self._zone_map.get_zone_bounds(self.zone_hash)
+            zone_hw = (mx[0] - mn[0]) / 2.0  # half-width
+            zone_hh = (mx[1] - mn[1]) / 2.0  # half-height
+        except Exception:
+            zone_hw = zone_hh = zone_radius
+
+        # 4 CORNER points at 92% of zone extent - CRITICAL for square coverage!
+        # Push closer to actual corners to overcome wall repulsion
+        for sx, sy in [(1, 1), (1, -1), (-1, 1), (-1, -1)]:
+            px = zone_center[0] + sx * 0.92 * zone_hw
+            py = zone_center[1] + sy * 0.92 * zone_hh
+            patrol_cells.append(np.array([px, py, 3.0]))
+
+        # 4 EDGE midpoints at 95% of zone extent
+        for sx, sy in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
+            px = zone_center[0] + sx * 0.95 * zone_hw
+            py = zone_center[1] + sy * 0.95 * zone_hh
+            patrol_cells.append(np.array([px, py, 3.0]))
+
+        # 4 INNER points for zone coverage
+        for sx, sy in [(0.5, 0.5), (0.5, -0.5), (-0.5, 0.5), (-0.5, -0.5)]:
+            px = zone_center[0] + sx * zone_hw
+            py = zone_center[1] + sy * zone_hh
+            patrol_cells.append(np.array([px, py, 3.0]))
 
         n_cells = len(patrol_cells)
 
         for i, scout in enumerate(scouts):
             scout_key = id(scout)
 
+            # Initialize scout with a patrol point (spread scouts across different regions)
             if scout_key not in self._scout_waypoints:
-                cell_idx = i % n_cells
+                # Start scouts at CORNER points (indices 0-3) for immediate corner coverage
+                # Corners are critical for achieving >75% coverage in square zones
+                n_corners = 4
+                cell_idx = i % n_corners  # Cycle through 4 corners first
                 self._scout_waypoints[scout_key] = patrol_cells[cell_idx].copy()
                 self._scout_waypoints[str(scout_key) + '_cell_idx'] = cell_idx
 
             target = self._scout_waypoints[scout_key]
             dist = float(np.linalg.norm(scout.pos - target))
-            ARRIVAL = 1.2
+            ARRIVAL = 1.5  # Arrival radius
 
+            # When scout arrives, assign next patrol point
             if dist < ARRIVAL:
                 old_idx = self._scout_waypoints.get(str(scout_key) + '_cell_idx', i)
-                stride = max(1, n_cells // len(scouts))
+
+                # EACH SCOUT USES DIFFERENT STRIDE to avoid path collisions
+                # Stride coprime to n_cells ensures all points visited
+                # Scout 0: stride=1, Scout 1: stride=5, Scout 2: stride=7
+                STRIDES = [1, 5, 7, 11]  # All coprime to 12 (n_cells)
+                stride = STRIDES[i % len(STRIDES)]
+
                 new_idx = (old_idx + stride) % n_cells
                 self._scout_waypoints[scout_key] = patrol_cells[new_idx].copy()
                 self._scout_waypoints[str(scout_key) + '_cell_idx'] = new_idx
@@ -686,10 +727,11 @@ class Node:
         self.assign_scout_patrol_targets(scouts)
 
         try:
-            hw = self._zone_map.arena_w / 2 - 0.5
-            hh = self._zone_map.arena_h / 2 - 0.5
+            # Reduced safety margin from 0.5m to 0.2m for better edge coverage
+            hw = self._zone_map.arena_w / 2 - 0.2
+            hh = self._zone_map.arena_h / 2 - 0.2
         except Exception:
-            hw = hh = 9.5
+            hw = hh = 7.3
 
         for i, scout in enumerate(scouts):
             scout_key = id(scout)

@@ -101,6 +101,7 @@ class General:
         self._scenario: str = 'default'
         self._llm_decision_timer: float = 0.0
         self._llm_decision_interval: float = 15.0
+        self._reasoning_buffer: List[str] = []  # Rolling buffer of last 5 reasoning messages
 
     def _build_waypoints(self) -> List[np.ndarray]:
         """Build 4 corner exploration points per zone, shuffled so zones get variety."""
@@ -304,16 +305,20 @@ class General:
             np.array([-1.0, -1.0, 0.0]),
             np.array([ 1.0, -1.0, 0.0]),
         ]
-        corner_cycle = self._wp_index % 4
-        for zone_hash in self._zone_map.active_zones():
+        # FIX: Each zone gets a DIFFERENT corner offset to spread across quadrants
+        active_zones = list(self._zone_map.active_zones())
+        for zone_idx, zone_hash in enumerate(active_zones):
             if zone_hash in self._collective_zone_wp:
                 wp = self._collective_zone_wp[zone_hash].copy()
             else:
                 centre = self._zone_map.get_zone_centre(zone_hash)
-                off    = corners[corner_cycle]
+                # Use zone index + time offset so each zone gets different corner
+                corner_idx = (zone_idx + self._wp_index) % 4
+                off    = corners[corner_idx]
+                # Offset WITHIN zone bounds (0.25 of zone size keeps it inside)
                 wp     = np.array([
-                    centre[0] + off[0] * self._zone_map.cell_w * 0.38,
-                    centre[1] + off[1] * self._zone_map.cell_h * 0.38,
+                    centre[0] + off[0] * self._zone_map.cell_w * 0.25,
+                    centre[1] + off[1] * self._zone_map.cell_h * 0.25,
                     3.0,
                 ])
             mode  = self.select_mode_for_zone(zone_hash)
@@ -342,16 +347,17 @@ class General:
         """
         Seeds every Node with a goal token pointing to a corner of its zone.
         The corner is offset from the zone centre so waypoint != node position.
+        Each zone gets a different corner to spread nodes across quadrants.
         """
         corner_offsets = [
-            np.array([ 0.38,  0.38, 0.0]),
-            np.array([-0.38,  0.38, 0.0]),
-            np.array([-0.38, -0.38, 0.0]),
-            np.array([ 0.38, -0.38, 0.0]),
+            np.array([ 0.25,  0.25, 0.0]),   # Zone 0: top-right within zone
+            np.array([-0.25,  0.25, 0.0]),   # Zone 1: top-left within zone
+            np.array([-0.25, -0.25, 0.0]),   # Zone 2: bottom-left within zone
+            np.array([ 0.25, -0.25, 0.0]),   # Zone 3: bottom-right within zone
         ]
         for i, zone_hash in enumerate(self._zone_map.active_zones()):
             centre = self._zone_map.get_zone_centre(zone_hash)
-            off    = corner_offsets[i % 4]
+            off    = corner_offsets[i % 4]  # Each zone gets different offset
             wp     = np.array([
                 centre[0] + off[0] * self._zone_map.cell_w,
                 centre[1] + off[1] * self._zone_map.cell_h,
@@ -370,7 +376,10 @@ class General:
         Used when fire/threat is detected and all assets needed.
         Overrides individual zone assignments temporarily.
         """
-        print(f'[General] COLLECTIVE CONVERGE → {np.round(target[:2],1)}')
+        if target is not None and target[0] is not None:
+            print(f'[General] COLLECTIVE CONVERGE → {np.round(target[:2],1)}')
+        else:
+            print(f'[General] COLLECTIVE CONVERGE → target=None')
         self._mission_phase = 'CONVERGE'
         for zone_hash in self._zone_map.active_zones():
             self._collective_zone_wp[zone_hash] = target.copy()
@@ -417,6 +426,10 @@ class General:
         """
         Called every step. Fires LLM every llm_decision_interval seconds.
         """
+        # Allow disabling LLM for testing
+        if hasattr(self, '_enable_llm') and not self._enable_llm:
+            return
+
         self._llm_decision_timer += dt
         if self._llm_decision_timer < self._llm_decision_interval:
             return
@@ -427,6 +440,11 @@ class General:
             return
 
         decision = self._llm.decide(summary, self._scenario)
+
+        # Capture reasoning for UI feed
+        reasoning = decision.get('reasoning', 'No reasoning provided')
+        self._add_reasoning_message(reasoning)
+
         self._apply_decision(decision, nodes)
 
     def _apply_decision(self, decision: dict, nodes: List) -> None:
@@ -473,6 +491,29 @@ class General:
             return {'zone_hash': worst_zone, 'score': worst_score,
                     'centroid': self._world_model[worst_zone].get('centroid', [0, 0, 3])}
         return None
+
+    def _add_reasoning_message(self, message: str) -> None:
+        """
+        Add a reasoning message to the rolling buffer.
+        Cap at 5 messages (most recent). Truncate long messages to fit on screen.
+        """
+        # Truncate to 120 chars max
+        if len(message) > 120:
+            message = message[:117] + '...'
+
+        # Add to buffer
+        self._reasoning_buffer.append(message)
+
+        # Cap at 5 messages (most recent)
+        if len(self._reasoning_buffer) > 5:
+            self._reasoning_buffer = self._reasoning_buffer[-5:]
+
+    def get_reasoning_messages(self) -> List[str]:
+        """
+        Get the rolling buffer of reasoning messages for UI display.
+        Returns list of up to 5 most recent reasoning strings.
+        """
+        return self._reasoning_buffer.copy()
 
     # ── Zone Topology ──
 

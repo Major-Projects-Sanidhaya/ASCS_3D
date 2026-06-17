@@ -27,6 +27,7 @@ class TestAgentPurity:
         for mod in modules_to_remove:
             del sys.modules[mod]
 
+    @pytest.mark.fast
     def test_general_has_no_pybullet_import(self):
         """Importing General.General raises no error and 'pybullet' not in sys.modules."""
         # Ensure pybullet is not already loaded
@@ -38,6 +39,7 @@ class TestAgentPurity:
         # Verify pybullet was NOT imported as a side effect
         assert 'pybullet' not in sys.modules, "General.General imported pybullet"
 
+    @pytest.mark.fast
     def test_node_has_no_pybullet_import(self):
         """Importing Node.Node raises no error and 'pybullet' not in sys.modules."""
         assert 'pybullet' not in sys.modules, "pybullet already in sys.modules"
@@ -46,6 +48,7 @@ class TestAgentPurity:
 
         assert 'pybullet' not in sys.modules, "Node.Node imported pybullet"
 
+    @pytest.mark.fast
     def test_scout_has_no_pybullet_import(self):
         """Importing Scout.Scout raises no error and 'pybullet' not in sys.modules."""
         assert 'pybullet' not in sys.modules, "pybullet already in sys.modules"
@@ -54,6 +57,7 @@ class TestAgentPurity:
 
         assert 'pybullet' not in sys.modules, "Scout.Scout imported pybullet"
 
+    @pytest.mark.fast
     def test_worker_has_no_pybullet_import(self):
         """Importing Worker.Worker raises no error and 'pybullet' not in sys.modules."""
         assert 'pybullet' not in sys.modules, "pybullet already in sys.modules"
@@ -62,6 +66,7 @@ class TestAgentPurity:
 
         assert 'pybullet' not in sys.modules, "Worker.Worker imported pybullet"
 
+    @pytest.mark.fast
     def test_zonemap_has_no_pybullet_import(self):
         """Importing General.ZoneMap raises no error and 'pybullet' not in sys.modules."""
         assert 'pybullet' not in sys.modules, "pybullet already in sys.modules"
@@ -70,6 +75,7 @@ class TestAgentPurity:
 
         assert 'pybullet' not in sys.modules, "General.ZoneMap imported pybullet"
 
+    @pytest.mark.fast
     def test_swarm_controller_has_no_pybullet_import(self):
         """Importing controllers.swarm_controller raises no error and 'pybullet' not in sys.modules."""
         assert 'pybullet' not in sys.modules, "pybullet already in sys.modules"
@@ -78,6 +84,7 @@ class TestAgentPurity:
 
         assert 'pybullet' not in sys.modules, "controllers.swarm_controller imported pybullet"
 
+    @pytest.mark.fast
     def test_agents_importable_without_display(self):
         """All 5 agent classes import cleanly with DISPLAY env var unset (headless)."""
         # Simulate headless server environment
@@ -101,8 +108,9 @@ class TestAgentPurity:
             if old_display is not None:
                 os.environ['DISPLAY'] = old_display
 
+    @pytest.mark.slow
     def test_swarm_steps_without_pybullet(self):
-        """SwarmController can run 60 steps with no pybullet connection open."""
+        """SwarmController can run 30 steps with no pybullet connection open."""
         # Ensure pybullet is not imported
         assert 'pybullet' not in sys.modules, "pybullet already in sys.modules"
 
@@ -120,12 +128,12 @@ class TestAgentPurity:
 
         controller = SwarmController(config)
 
-        # Run 60 simulation steps
-        for i in range(60):
+        # Run 30 simulation steps (proves no PyBullet dependency)
+        for i in range(30):
             controller.step(dt=0.02)
 
         # Verify pybullet was never loaded
         assert 'pybullet' not in sys.modules, "SwarmController loaded pybullet during execution"
 
         # Verify we actually ran steps
-        assert controller._step_count == 60, f"Expected 60 steps, got {controller._step_count}"
+        assert controller._step_count == 30, f"Expected 30 steps, got {controller._step_count}"

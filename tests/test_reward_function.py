@@ -47,6 +47,7 @@ class TestRewardFunction:
             }
             node.receive_scout_packet(packet)
 
+    @pytest.mark.slow
     def test_reward_is_not_constant_phase1(self, node):
         """Run 200 steps in phase 1, collect rewards, assert std > 0.01 (not constant)."""
         rewards = []
@@ -66,6 +67,7 @@ class TestRewardFunction:
         std = np.std(rewards)
         assert std > 0.01, f"Phase 1 rewards appear constant: std={std:.6f}"
 
+    @pytest.mark.slow
     def test_reward_is_not_constant_phase2(self, node):
         """Run 200 steps in phase 2, collect rewards, assert std > 0.01 (not constant)."""
         rewards = []
@@ -89,6 +91,7 @@ class TestRewardFunction:
         std = np.std(rewards)
         assert std > 0.01, f"Phase 2 rewards appear constant: std={std:.6f}"
 
+    @pytest.mark.slow
     def test_reward_is_not_constant_phase3(self, node):
         """Run 200 steps in phase 3, collect rewards, assert std > 0.01 (not constant)."""
         rewards = []
@@ -112,6 +115,7 @@ class TestRewardFunction:
         std = np.std(rewards)
         assert std > 0.01, f"Phase 3 rewards appear constant: std={std:.6f}"
 
+    @pytest.mark.slow
     def test_reward_range_phase1(self, node):
         """All phase 1 rewards must be in [-1.0, 1.0]."""
         rewards = []
@@ -134,6 +138,7 @@ class TestRewardFunction:
         assert min(rewards) < -0.3, "Phase 1 should produce some negative rewards"
         assert max(rewards) > 0.0, "Phase 1 should produce some positive rewards"
 
+    @pytest.mark.slow
     def test_reward_range_phase2(self, node):
         """All phase 2 rewards must be in [-1.0, 1.0]."""
         rewards = []
@@ -155,6 +160,7 @@ class TestRewardFunction:
 
             assert -1.0 <= reward <= 1.0, f"Phase 2 reward {reward:.3f} out of range"
 
+    @pytest.mark.slow
     def test_reward_doing_nothing_is_zero(self, node):
         """Apply zero RL offsets for 100 steps, mean reward should be within [-0.1, 0.1]."""
         rewards = []
@@ -181,6 +187,7 @@ class TestRewardFunction:
         assert -0.1 <= mean_reward <= 0.1, \
             f"Doing nothing should yield ~0 reward, got mean={mean_reward:.3f}"
 
+    @pytest.mark.slow
     def test_positive_offset_changes_reward(self, node):
         """Apply max positive vs max negative offsets, mean rewards differ by > 0.05.
 
@@ -276,6 +283,7 @@ class TestRewardFunction:
         # by checking that rewards are consistently different
         assert mean_pos != mean_neg, "Rewards should be measurably different"
 
+    @pytest.mark.slow
     def test_reward_phase2_includes_phase1(self, node):
         """Phase 2 reward has same collision component as phase 1 plus waypoint term."""
         node._waypoint = np.array([5.0, 5.0, 3.0])
@@ -307,6 +315,7 @@ class TestRewardFunction:
         assert abs(reward_phase2 - reward_phase1) > 0.01, \
             "Phase 2 waypoint term should contribute meaningfully"
 
+    @pytest.mark.slow
     def test_prev_coverage_tracked(self, node):
         """After 100 steps with varying coverage, node._prev_coverage is not 0.0."""
         node._coverage_fraction = 0.0
