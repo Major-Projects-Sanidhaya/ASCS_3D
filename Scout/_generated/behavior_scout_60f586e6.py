@@ -4,23 +4,23 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from Scout.scout_behavior import ScoutBehavior
 
-class Scout_scout_ce5241cf_Behavior(ScoutBehavior):
+class Scout_scout_60f586e6_Behavior(ScoutBehavior):
     """
-    Auto-generated behavior for scout scout_ce5241cf in zone 3.
+    Auto-generated behavior for scout scout_60f586e6 in zone 2.
     Generated at spawn. Destroyed at deletion.
-    Personality: w_sep=1.020 w_wp=2.672
-                 max_speed=4.87 bias=[-0.5967, 0.0731]
+    Personality: w_sep=1.141 w_wp=2.567
+                 max_speed=5.57 bias=[0.5888, -0.1413]
     """
 
-    MAX_SPEED    = 4.8747
-    SEP_RADIUS   = 1.6008
-    W_SEP        = 1.0198
-    W_WP         = 2.6720
-    EXPLORE_BIAS = np.array([-0.5967, 0.0731])
+    MAX_SPEED    = 5.5718
+    SEP_RADIUS   = 1.5239
+    W_SEP        = 1.1405
+    W_WP         = 2.5665
+    EXPLORE_BIAS = np.array([0.5888, -0.1413])
 
     def __init__(self, scout_id, zone_hash, patrol_target):
         super().__init__(scout_id, zone_hash, patrol_target)
-        self.arrival_dist = 1.3197
+        self.arrival_dist = 0.8397
 
     def compute_velocity(self, pos, vel, neighbor_pos,
                          obs_min, arena_hw, arena_hh):
@@ -69,4 +69,4 @@ class Scout_scout_ce5241cf_Behavior(ScoutBehavior):
 
 
 def create():
-    return Scout_scout_ce5241cf_Behavior
+    return Scout_scout_60f586e6_Behavior
